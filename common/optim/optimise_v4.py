@@ -100,13 +100,14 @@ class ParameterProcessor:
             return norm2_squared
 
 class StepResult:
-    def __init__(self, logits, eta, eta_raw, eta_ratio, ck_armiho=0.0, ck_wolf=0.0):
+    def __init__(self, logits, eta, eta_raw, eta_ratio, ck_armiho=0.0, ck_wolf=0.0, qq_test=0.0):
         self.logits = logits
         self.eta = eta
         self.eta_raw = eta_raw
         self.eta_ratio = eta_ratio
         self.ck_armiho = ck_armiho
         self.ck_wolf = ck_wolf
+        self.qq_test = qq_test
 
 class NetLineStepProcessor:
     def __init__(self, net, criterion, meta, device, lbd_dict=None):
@@ -114,7 +115,7 @@ class NetLineStepProcessor:
         self.meta = meta
         self.device = device
         self.epsilon = 1e-9
-        self.epsilon_criteria = 1e-5
+        self.epsilon_criteria = 1e-9
         self.lbd_dict = lbd_dict
         self.criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
         self.paramProcessor = ParameterProcessor()
@@ -144,8 +145,8 @@ class NetLineStepProcessor:
     def step(self, labels, images, momentum, nesterov = False, step_params = None):
         net = self.net
         meta = self.meta
-        if net.training:
-            raise ValueError("net.training must be False")
+        #if net.training:
+        #    raise ValueError("net.training must be False")
         pp = labels_to_softhot(labels, meta)
         self.paramProcessor.save_theta(net)
 
@@ -169,11 +170,14 @@ class NetLineStepProcessor:
                 loss_initial = crossentropy_avg(pp, qq0)
                 logging.info("##Loss initial:{}".format(loss_initial))
                 eta_curr, eta_next = self.eta0, 0. #small step-size η0, η1, k ← ηtest, 0, 0
+                qq_test = None
                 iter_num, iter_cond =  0, True
                 while iter_cond:
                     self.paramProcessor.set_theta(net, momentum, eta_curr, 1.0) #small step
                     logits1 = self.do_forward(images, 'train') ## no new dropout generated here, a generated in (1*) must be used
                     qq1 = self.softmax(logits1, meta) #q(t+1)
+                    if qq_test is None:
+                        qq_test = norm_fro(qq1 - qq0, ord=2)
                     eta_next = self.eta_analytic_n2(eta_curr, pp, qq0, qq1)
                     eta_ratio = eta_next/(eta_curr + self.epsilon)
                     logging.info("##--==On iter {} for eta_curr={} eta_next={} with ratio={} ==--"\
@@ -217,7 +221,7 @@ class NetLineStepProcessor:
 
         logging.info("##Eta-value after conditions are applied: {}".format(eta*eta_scale))
         self.paramProcessor.save_delta_current(momentum, eta, eta_scale)
-        return StepResult(logits, eta*eta_scale, eta_curr*momentum_coeff, eta_ratio, ck1_armiho, ck1_wolf)
+        return StepResult(logits, eta*eta_scale, eta_curr*momentum_coeff, eta_ratio, ck1_armiho, ck1_wolf, qq_test)
     
     def get_param(self, step_params, param_name, default):
         if step_params is None:
