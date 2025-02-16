@@ -109,17 +109,73 @@ class StepResult:
         self.pq_norm = pq_norm
         self.qq_norm = qq_norm
 
-class NetLineStepProcessor:
-    def __init__(self, net, criterion, meta, device, lbd_dict=None):
+class NetLineStepProcessorAbstract:
+    def __init__(self, net, meta, device, lbd_dict=None):
         self.net = net
         self.meta = meta
         self.device = device
         self.epsilon = 1e-9
         self.epsilon_criteria = 1e-9
         self.lbd_dict = lbd_dict
-        self.criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
         self.paramProcessor = ParameterProcessor()
         self.training_mode = False
+
+        self.eta_min = 0.000001
+        self.eta_max = 1.
+        self.alpha = 0.01
+        self.beta = 0.001
+        self.eta0 = 0.0001
+
+    def get_param(self, step_params, param_name, default):
+        if step_params is None:
+            return default
+        return step_params.get(param_name, default)
+
+    def cos_phi(self, vector1, vector2, norm1, norm2):
+        with torch.no_grad():
+            cos_phi = (torch.sum(vector1*vector2)/(norm1*norm2 + self.epsilon)).item()
+            return cos_phi
+
+    def eta_analytic_n2(self, eta_test, pp, qq0, qq_test):
+        with torch.no_grad():
+            delta_pq, delta_qq = pp-qq0, qq_test-qq0
+            norm_pq, norm_qq = norm_fro(delta_pq, ord=2), norm_fro(delta_qq, ord=2)
+            cos_phi1 = self.cos_phi(delta_pq, delta_qq, norm_pq, norm_qq)
+            logging.info("##cos(pp^qq)={}, norm_pq={}, norm_qq={}".format(cos_phi1, norm_pq, norm_qq))
+            eta_next = sign(cos_phi1)*math.sqrt(abs(((norm_pq*cos_phi1*eta_test*self.alpha)/(norm_qq + self.beta))))
+            logging.info("##Eta-value estimations: analytic={}".format(eta_next))
+            return eta_next, norm_pq, norm_qq
+
+    def softmax(self, logits, meta):
+        with torch.no_grad():
+            return (F.softmax(torch.transpose(logits, 0, 1), dim=0) + self.epsilon).to(meta.device)
+
+    def eta_bounded(self, eta):
+        if abs(eta) > self.eta_max:
+            logging.info("##Eta-value is reduced from {} to {}".format(eta, self.eta_max*sign(eta)))
+            eta = self.eta_max*sign(eta)
+        if abs(eta) < self.eta_min:
+            logging.info("##Eta-value is increased from {} to {}".format(eta, self.eta_min*sign(eta)))
+            eta = self.eta_min*sign(eta)
+        return eta
+
+    #dropout_mode = 'eval' #toss/train/eval
+    def do_forward(self, images, dropout_mode):
+        net = self.net
+        if self.training_mode and dropout_mode == 'toss':
+            training = net.training
+            net.train(True)
+            logging.info("##--==Explicit train forward==--")
+            logits = net.forward(images)
+            net.train(training)
+            return logits
+        else:
+            return net.forward(images)
+
+class NetLineStepProcessor(NetLineStepProcessorAbstract):
+    def __init__(self, net, criterion, meta, device, lbd_dict=None):
+        super().__init__(net, meta, device, lbd_dict) 
+        self.criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
 
     #Armiho: Loss(θ+α) <= c1*α*∇Loss(θ) + Loss(θ)
     #Wolf: |∇Loss(θ+α)| <= c2*|∇Loss(θ)|
@@ -129,12 +185,6 @@ class NetLineStepProcessor:
         self.c2 = 0.999999
         self.c3 = 0.25
         self.armiho_beta = 0.5
-
-        self.eta_min = 0.000001
-        self.eta_max = 1.
-        self.alpha = 0.01
-        self.beta = 0.001
-        self.eta0 = 0.0001
 
     """
     step_params: check_armiho=True/False (default False); check_additional=True/False (default False);
@@ -148,7 +198,6 @@ class NetLineStepProcessor:
         pp = labels_to_softhot(labels, meta)
         self.paramProcessor.save_theta(net)
 
-        diff_initial, eta_ratio = 0.0, 0.0
         if momentum > 0.0 and nesterov == True and self.paramProcessor.is_delta_empty() == False:
             self.paramProcessor.set_theta(net, momentum, 0., 0.)
 
@@ -198,11 +247,6 @@ class NetLineStepProcessor:
         self.paramProcessor.save_delta_current(momentum, eta, eta_scale)
         return StepResult(logits, eta*eta_scale, eta_curr, eta_ratio, ck1_armiho, ck1_wolf, norm_pq, norm_qq)
 
-    def get_param(self, step_params, param_name, default):
-        if step_params is None:
-            return default
-        return step_params.get(param_name, default)
-
     def step_reduction(self, images, pp, qq0, qq1, logits1, loss_initial, momentum, eta, step_params):
         net = self.net
         meta = self.meta
@@ -237,43 +281,68 @@ class NetLineStepProcessor:
             
             return eta_scale, logits_k, ck1_armiho, ck1_wolf
 
-    def pq_cos(self, vector1, vector2, norm1, norm2):
-        with torch.no_grad():
-            cos_phi = (torch.sum(vector1*vector2)/(norm1*norm2 + self.epsilon)).item()
-            return cos_phi
+class NetLineStepProcessorMSE(NetLineStepProcessorAbstract):
+    def __init__(self, net, criterion, meta, device, lbd_dict=None):
+        super().__init__(net, meta, device, lbd_dict) 
+        self.criterion = criterion if criterion is not None else nn.MSELoss()
 
-    def eta_analytic_n2(self, eta_test, pp, qq0, qq_test):
-        with torch.no_grad():
-            delta_pq, delta_qq = pp-qq0, qq_test-qq0
-            norm_pq, norm_qq = norm_fro(delta_pq, ord=2), norm_fro(delta_qq, ord=2)
-            cos_phi1 = self.pq_cos(delta_pq, delta_qq, norm_pq, norm_qq)
-            logging.info("##cos(pp^qq)={}, norm_pq={}, norm_qq={}".format(cos_phi1, norm_pq, norm_qq))
-            eta_next = sign(cos_phi1)*math.sqrt(abs(((norm_pq*cos_phi1*eta_test*self.alpha)/(norm_qq + self.beta))))
-            logging.info("##Eta-value estimations: analytic={}".format(eta_next))
-            return eta_next, norm_pq, norm_qq
-
-    def softmax(self, logits, meta):
-        with torch.no_grad():
-            return (F.softmax(torch.transpose(logits, 0, 1), dim=0) + self.epsilon).to(meta.device)
-
-    def eta_bounded(self, eta):
-        if abs(eta) > self.eta_max:
-            logging.info("##Eta-value is reduced from {} to {}".format(eta, self.eta_max*sign(eta)))
-            eta = self.eta_max*sign(eta)
-        if abs(eta) < self.eta_min:
-            logging.info("##Eta-value is increased from {} to {}".format(eta, self.eta_min*sign(eta)))
-            eta = self.eta_min*sign(eta)
-        return eta
-
-    #dropout_mode = 'eval' #toss/train/eval
-    def do_forward(self, images, dropout_mode):
+    """
+    step_params: check_eta2=True/False (default False); set_eta2=True/False (default False)
+    """
+    def step(self, labels, images, momentum = 0.0, nesterov = False, step_params = None):
         net = self.net
-        if self.training_mode and dropout_mode == 'toss':
-            training = net.training
-            net.train(True)
-            logging.info("##--==Explicit train forward==--")
-            logits = net.forward(images)
-            net.train(training)
-            return logits
-        else:
-            return net.forward(images)
+        meta = self.meta
+        #if net.training:
+        #    raise ValueError("net.training must be False")
+        #pp = labels_to_softhot(labels, meta)
+        xx, yy = images, labels
+        self.paramProcessor.save_theta(net)
+
+        if momentum > 0.0 and nesterov == True and self.paramProcessor.is_delta_empty() == False:
+            self.paramProcessor.set_theta(net, momentum, 0., 0.)
+
+        logging.info("##Calculating params-delta")
+        net.zero_grad()
+        #logits = self.do_forward(images, 'toss') ## new dropout is generated here (1*)
+        zz = self.do_forward(xx, 'toss') ## new dropout is generated here (1*)
+        loss = self.criterion(zz, yy)
+        grad_norm2 = math.sqrt(self.paramProcessor.calc_autograd(net, loss, self.lbd_dict))
+        logging.info("##Gradient norm2:{}".format(grad_norm2))
+        with torch.no_grad():
+            if self.training_mode:
+                zz = self.do_forward(xx, 'train') ## all qqxx calculated with dropout off
+            #Eta-calculation
+            zz0 = zz #self.softmax(logits, meta) #z(t)
+            loss_initial = self.criterion(yy, zz0)
+            logging.info("##Loss initial:{}".format(loss_initial))
+            eta_curr = self.eta0 #small step-size
+            self.paramProcessor.set_theta(net, momentum, eta_curr, 1.0) #small step
+            zz1 = self.do_forward(images, 'train') #z(t+1)_test
+            #qq1 = self.softmax(logits1, meta)
+            eta_next, norm_yz, norm_zz = self.eta_analytic_n2(eta_curr, yy, zz0, zz1)
+            eta_ratio = eta_next/(eta_curr + self.epsilon)
+            logging.info("##--==On step 1 for eta_curr={} eta_next={} with ratio={} ==--".format(eta_curr, eta_next, eta_ratio))
+            eta_curr = eta_next
+            self.paramProcessor.set_theta(net, momentum, eta_curr, 1.0) #1st step
+            if (self.get_param(step_params, 'check_eta2', False) == True or self.get_param(step_params, 'set_eta2', False) == True):
+                zz12 = self.do_forward(images, 'train') #z(t+1)
+                #zz12 = self.softmax(logits12, meta)
+                eta_next, _, _ = self.eta_analytic_n2(eta_curr, yy, zz0, zz12)
+                eta_ratio = eta_next/(eta_curr + self.epsilon)
+                logging.info("##--==On step 2 for eta_curr={} eta_next={} with ratio={} ==--".format(eta_curr, eta_next, eta_ratio))
+                if (self.get_param(step_params, 'set_eta2', False) == True):
+                    zz1, eta_curr = zz12, eta_next
+                    self.paramProcessor.set_theta(net, momentum, eta_curr, 1.0) #2st step                    
+
+            eta = self.eta_bounded(eta_curr)
+            if eta != eta_curr:
+                self.paramProcessor.set_theta(net, momentum, eta, 1.0)
+                zz1 = self.do_forward(images, 'train')
+                #qq1 = self.softmax(logits1, meta)
+
+        eta_scale, logits, ck1_armiho, ck1_wolf = 1.0, zz1, 1.0, 0.0
+        #Armiho-check is not implemented for MSE-loss
+
+        logging.info("##Eta-value after conditions are applied: {}".format(eta*eta_scale))
+        self.paramProcessor.save_delta_current(momentum, eta, eta_scale)
+        return StepResult(logits, eta*eta_scale, eta_curr, eta_ratio, ck1_armiho, ck1_wolf, norm_yz, norm_zz)
