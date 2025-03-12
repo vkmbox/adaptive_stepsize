@@ -3,6 +3,7 @@ import collections
 
 import torch
 from torch import nn
+from torch.linalg import norm
 import torch.nn.functional as F
 
 import numpy as np
@@ -11,20 +12,6 @@ import logging
 
 def sign(number):
     return (-1.0 if number < 0.0 else 1.0)
-
-def reduce_to_active(matrix, pp):
-    with torch.no_grad():
-        return torch.sum(matrix*pp, 0)
-    
-def norm_fro(tensor, ord=2):
-    with torch.no_grad():
-        return math.pow((torch.sum(torch.abs(tensor)**ord)).item(), 1/ord)
-
-def crossentropy_avg_old(pp, qq):
-    with torch.no_grad():
-        batch_size = pp.shape[1]
-        loss = -torch.sum(pp * torch.log(qq))/batch_size
-        return loss.item()
 
 #TODO: function requires optimisation/rewriting
 def labels_to_softhot(true_labels, meta):
@@ -91,7 +78,6 @@ class ParameterProcessor:
         df = torch.autograd.grad(loss, param_buffer.values())#, retain_graph=True, create_graph=True, allow_unused=True)
         logging.info("##Autograd finish")
         with torch.no_grad():
-            #norm2_squared = 0.
             ii = 0
             for name in param_buffer:
                 lambda_value = lambda_dict.get(name, 1.) if lambda_dict is not None else 1.
@@ -99,9 +85,7 @@ class ParameterProcessor:
                 if lambda_value != 1. :
                     grad = lambda_value * grad
                 self.grad_current[name] = grad
-                #norm2_squared += ((grad)**2).sum().item()
                 ii += 1
-            #return norm2_squared
 
 class StepResult:
     def __init__(self, logits, eta, eta_raw, eta_ratio2, ck_armiho=0.0, ck_wolf=0.0, pq_norm=0.0, qq_norm=0.0):
@@ -136,16 +120,19 @@ class NetLineStepProcessorAbstract:
             return default
         return step_params.get(param_name, default)
 
+    '''
     def cos_phi(self, vector1, vector2, norm1, norm2):
         with torch.no_grad():
             cos_phi = (torch.sum(vector1*vector2)/(norm1*norm2 + self.epsilon)).item()
             return cos_phi
+    '''
 
     def eta_analytic_n2(self, eta_test, pp, qq0, qq_test):
         with torch.no_grad():
             delta_pq, delta_qq = pp-qq0, qq_test-qq0
-            norm_pq, norm_qq = norm_fro(delta_pq, ord=2), norm_fro(delta_qq, ord=2)
-            cos_phi1 = self.cos_phi(delta_pq, delta_qq, norm_pq, norm_qq)
+            norm_pq, norm_qq = norm(delta_pq, ord='fro').item(), norm(delta_qq, ord='fro').item()
+            cos_phi1 = (torch.sum(delta_pq*delta_qq).item()/(norm_pq*norm_qq + self.epsilon))
+            #self.cos_phi(delta_pq, delta_qq, norm_pq, norm_qq)
             logging.info("##cos(pp^qq)={}, norm_pq={}, norm_qq={}".format(cos_phi1, norm_pq, norm_qq))
             eta_next = sign(cos_phi1)*math.sqrt(abs(((norm_pq*cos_phi1*eta_test*self.alpha)/(norm_qq + self.beta))))
             logging.info("##Eta-value estimations: analytic={}".format(eta_next))
@@ -154,14 +141,6 @@ class NetLineStepProcessorAbstract:
     def softmax(self, logits, meta):
         with torch.no_grad():
             return (F.softmax(torch.transpose(logits, 0, 1), dim=0) + self.epsilon).to(meta.device)
-
-    #TODO: function requires optimisation/rewriting
-    def crossentropy_avg(self, pp, qq):
-        with torch.no_grad():
-            #return (F.nll_loss(torch.log(torch.transpose(qq, 0, 1)), true_labels, reduction='mean')).item()
-            batch_size = pp.shape[1]
-            loss = -torch.sum(torch.log(torch.sum(pp*qq, 0)))/batch_size
-            return loss.item()
 
     def eta_bounded(self, eta):
         if abs(eta) > self.eta_max:
@@ -200,8 +179,7 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
         self.armiho_beta = 0.5
 
     """
-    step_params: check_armiho=True/False (default False); check_additional=True/False (default False);
-                 check_eta2=True/False (default False); set_eta2=True/False (default False)
+    step_params: check_eta2=True/False (default False); set_eta2=True/False (default False)
     """
     def step(self, labels, images, momentum = 0.0, nesterov = False, step_params = None):
         net = self.net
@@ -229,8 +207,6 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
             #Eta-calculation
             qq0 = self.softmax(logits, meta) #q(t)
             logging.info("##Tmp: Before loss initial")
-            loss_initial = self.crossentropy_avg(pp, qq0)
-            logging.info("##Loss initial:{}".format(loss_initial)) #, crossentropy_avg_old(pp, qq0)))
             eta_curr = self.eta0 #small step-size
             self.paramProcessor.set_theta(net, momentum, eta_curr, 1.0) #small step
             logits1 = self.do_forward(images, 'train')
@@ -259,46 +235,9 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
                 qq1 = self.softmax(logits1, meta)
 
         eta_scale, logits, ck1_armiho, ck1_wolf = 1.0, logits1, 1.0, 0.0
-        if (self.get_param(step_params, 'check_armiho', True) == True or self.get_param(step_params, 'check_additional', True) == True):
-            eta_scale, logits, ck1_armiho, ck1_wolf = self.step_reduction(images, pp, qq0, qq1, logits1, loss_initial, momentum, eta, step_params)
-
         logging.info("##Eta-value after conditions are applied: {}".format(eta*eta_scale))
         self.paramProcessor.save_delta_current(momentum, eta, eta_scale)
         return StepResult(logits, eta*eta_scale, eta_curr, eta_ratio, ck1_armiho, ck1_wolf, norm_pq, norm_qq)
-
-    def step_reduction(self, images, pp, qq0, qq1, logits1, loss_initial, momentum, eta, step_params):
-        net = self.net
-        meta = self.meta
-        logits_k = None
-        eta_scale = 1.0
-        with torch.no_grad():
-            diff_initial = (torch.sum((pp/qq0)*(qq0-qq1))).item()/pp.shape[1]
-            while eta_scale > 0.001:
-                if eta_scale == 1.0:
-                    logits_k = logits1
-                else:
-                    self.paramProcessor.set_theta(net, momentum, eta, eta_scale)
-                    logits_k = self.do_forward(images, 'train') ## no new dropout generated here, a generated in (1*) must be used
-                qq = self.softmax(logits_k, meta)
-                loss_k = self.crossentropy_avg(pp, qq)
-                diff_k = (torch.sum((pp/qq)*(qq0-qq1))).item()/pp.shape[1]
-                #condition_armiho = loss_k - self.epsilon_criteria <= initialLoss + self.c1*eta_scale*diff_initial
-                #condition_wolf = abs(diff_k) - self.epsilon_criteria <= self.c2*abs(diff_initial)
-                ck1_armiho = (loss_k - self.epsilon_criteria - loss_initial)/(eta_scale*diff_initial+self.epsilon) #>=self.c1 when diff_initial < 0
-                ck1_wolf = (abs(diff_k) - self.epsilon_criteria)/abs(diff_initial+self.epsilon) #<= self.c2
-                condition_armiho = diff_initial < 0 and ck1_armiho >= self.c1
-                condition_wolf = ck1_wolf <= self.c2
-                condition_additional = diff_k - self.epsilon_criteria <= self.c3*abs(diff_initial)
-                logging.info("##Step with eta_scale: {}, loss = {}, df(0) = {}, df({}) = {}"\
-                             .format(eta_scale, loss_k, diff_initial, eta_scale, diff_k))
-                logging.info("##Conditions: armiho = {}, wolf = {}, additional = {}, armiho_k={}, wolf_k={}"\
-                             .format(condition_armiho, condition_wolf, condition_additional, ck1_armiho, ck1_wolf))
-                if (self.get_param(step_params, 'check_armiho', True) == False or condition_armiho) \
-                    and (self.get_param(step_params, 'check_additional', True) == False or condition_additional):
-                    break
-                eta_scale = eta_scale*self.armiho_beta
-            
-            return eta_scale, logits_k, ck1_armiho, ck1_wolf
 
 class NetLineStepProcessorMSE(NetLineStepProcessorAbstract):
     def __init__(self, net, criterion, meta, device, lbd_dict=None):
