@@ -1,0 +1,15 @@
+[package]
+name = "dynamic_module"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "dynamic_module"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = "0.24.0"
+numpy = "0.24.0"
+
+[profile.dev]
+opt-level = 3

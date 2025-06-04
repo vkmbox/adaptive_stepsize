@@ -3,3 +3,12 @@
 /datasets
 /logs
 /#11
+/#saves
+/#save
+/dynamic_module/target
+/lib
+/res.txt
+/datasets_regression/*.zip
+/dynamic_module/Cargo.lock
+/try.py
+/#docs
