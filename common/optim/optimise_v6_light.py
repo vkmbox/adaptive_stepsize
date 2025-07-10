@@ -12,10 +12,9 @@ import logging
 def sign(number):
     return (-1.0 if number < 0.0 else 1.0)
 
-
-def labels_to_softhot(true_labels, meta):
+def labels_to_softhot(true_labels, output_dim, meta):
     with torch.no_grad():
-        return torch.transpose(F.one_hot(true_labels, meta.output_dim), 0, 1).to(meta.device)
+        return torch.transpose(F.one_hot(true_labels, output_dim), 0, 1).to(meta.device)
 
 class ParameterProcessor:
     def __init__(self):
@@ -90,7 +89,7 @@ class ParameterProcessor:
 class StepResult:
     def __init__(self, eta, eta2, quadtatic_ratio, acc_ratio, by_rate_ratio,\
                  ck_armiho=0.0, ck_wolf=0.0, pq_norm=0.0, qq_norm=0.0, qq2_norm=0.0, norm_base=0.0, cos_phi=0.0, cos_base=0.0, \
-                 grad_norm2_squared=None, a0 = 0., a1 = 0., a1_2 = 0., a2 = 0., a3 = 0.):
+                 grad_norm2_squared=None, cos_phi_sample=None, ratio_sample=None): #a0 = 0., a1 = 0., a1_2 = 0., a2 = 0., a3 = 0.):
         self.eta = eta
         self.eta2 = eta2
         self.quadtatic_ratio = quadtatic_ratio
@@ -105,11 +104,15 @@ class StepResult:
         self.cos_phi = cos_phi
         self.cos_base = cos_base
         self.grad_norm2_squared = grad_norm2_squared
+        self.cos_phi_sample = cos_phi_sample
+        self.ratio_sample = ratio_sample
+        '''
         self.a0 = a0
         self.a1 = a1
         self.a1_2 = a1_2
         self.a2 = a2
         self.a3 = a3
+        '''
 
 class NetLineStepProcessorAbstract:
     def __init__(self, net, meta, device, lbd_dict=None):
@@ -181,19 +184,20 @@ class NetLineStepProcessorAbstract:
 
 class NetLineStepProcessor(NetLineStepProcessorAbstract):
     def __init__(self, net, criterion, meta, device, lbd_dict=None):
-        super().__init__(net, meta, device, lbd_dict) 
+        super().__init__(net, meta, device, lbd_dict)
         self.criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
 
     """
     step_params: ;
     """
-    def step(self, labels, images, momentum = 0.0, nesterov = False, weight_decay = 0.0):
+    def step(self, labels, images, momentum = 0.0, nesterov = False, weight_decay = 0.0, sample_labels=None, sample_images=None):
         net = self.net
         meta = self.meta
         #if net.training:
         #    raise ValueError("net.training must be False")
         logging.info("##Tmp: Calculating labels_to_softhot")
-        pp = labels_to_softhot(labels, meta)
+        pp = labels_to_softhot(labels, meta.output_dim, meta)
+        pp_sample = None if sample_labels is None else labels_to_softhot(sample_labels, sample_labels.size(dim=0), meta)
         logging.info("##Saving theta")
         self.paramProcessor.save_theta(net)
 
@@ -216,6 +220,8 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
                 logits = self.do_forward(images, 'train') ## all qqxx calculated with dropout off
             #Eta-calculation
             qq0 = self.softmax(logits, meta) #q(t)
+            qq0_sample =  None if sample_images is None else self.softmax(self.do_forward(sample_images, 'train'), meta)
+            #Sample 
             logging.info("##Tmp: Before loss initial")
             #eta_curr = self.eta1 #small step-size
             self.paramProcessor.set_theta(net, momentum, self.eta1, 1.0, weight_decay) #small step
@@ -239,6 +245,16 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
             eta_curr = eta2
             self.paramProcessor.set_theta(net, momentum, eta_curr, 1.0, weight_decay) #1st step
             logging.info("##Tmp:1st step finish")
+            cos_phi_sample, ratio_sample = None, None
+            if (sample_images is not None):
+                qq2_sample = self.softmax(self.do_forward(sample_images, 'train'), meta)
+                delta_pq_sample, delta_qq2_sample = pp_sample-qq0_sample, qq2_sample-qq0_sample
+                norm_pq_sample, norm_qq2_sample = norm(delta_pq_sample, ord='fro'), norm(delta_qq2_sample, ord='fro')
+                cos_phi_sample = torch.sum(delta_pq_sample*delta_qq2_sample)/(norm_pq_sample*norm_qq2_sample + self.epsilon)
+                ratio_sample = norm_pq_sample*cos_phi_sample/norm_qq2_sample
+                if self.do_logging:
+                    logging.info("##--==Sample: norm_pq={}, norm_qq2={}, cos_phi={}, norm_pq*cos_phi/norm_qq2={}"\
+                                 .format(norm_pq_sample, norm_qq2_sample, cos_phi_sample, norm_pq_sample*cos_phi_sample/norm_qq2_sample))
 
             cos_base, norm_base, norm_qq2 = 0., 0., 0.
             quadtatic_ratio, acc_ratio, by_rate_ratio = 1., 1., 1.
@@ -360,7 +376,8 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
             #    if 0.0 < correction_ratio and correction_ratio < self.quadratic_threshold else 1.0
             return StepResult( eta_curr, eta2, quadtatic_ratio, acc_ratio, by_rate_ratio\
                               , ck1_armiho, ck1_wolf, norm_pq, norm_qq1, norm_qq2, norm_base, cos_phi, cos_base, grad_norm2_squared\
-                              , a0, a1*eta2, a1_2*eta2, a2*(eta2**2), a3*(eta2**3))
+                              , cos_phi_sample, ratio_sample)
+                              #, a0, a1*eta2, a1_2*eta2, a2*(eta2**2), a3*(eta2**3))
         
     def rate_at(self, a0, a1, a2, a3, eta):
         return a0 + a1*eta + a2*(eta**2) + a3*(eta**3)
