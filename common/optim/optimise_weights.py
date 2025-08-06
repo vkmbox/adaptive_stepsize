@@ -30,6 +30,7 @@ class ParameterProcessor:
             for name, param in model.named_parameters():
                 self.theta_current[name] = param.detach().clone()
 
+    #TODO: slow procedure
     #theta_current must be saved at the current iteration's beginning, delta must be accumulated from previous iterations
     def set_theta(self, model, momentum, eta, eta_scale = 1.0, weight_decay = 0.0):
         eta_w = eta * eta_scale
@@ -46,11 +47,13 @@ class ParameterProcessor:
                 #    else:
                 #        param.data.copy_(theta_base)
                 elif eta_scale > 0.0 and momentum > 0.0:
+                    param_data = (1-eta_w*weight_decay)*theta_base - eta_w*grad
                     if delta is not None:
-                        #param.data.copy_(self.theta_current[name] + momentum * delta - eta_w * grad - eta_w*weight_decay*self.theta_current[name])
-                        param.data.copy_((1-eta_w*weight_decay)*theta_base + eta_w*momentum*delta - eta_w*grad)
-                    else:
-                        param.data.copy_((1-eta_w*weight_decay)*theta_base - eta_w*grad)
+                        param_data += eta_w*momentum*delta
+                        #param.data.copy_((1-eta_w*weight_decay)*theta_base + eta_w*momentum*delta - eta_w*grad)
+                    #else:
+                        #param.data.copy_((1-eta_w*weight_decay)*theta_base - eta_w*grad)
+                    param.data.copy_(param_data)
                 else:
                     raise ValueError("eta_scale must be in interval(0., 1.). momentum={}, eta={}, eta_scale={}"\
                                      .format(momentum, eta, eta_scale))
@@ -69,7 +72,7 @@ class ParameterProcessor:
                     self.delta_current[name] = momentum * delta - grad- weight_decay*self.theta_current[name]
 
     #Grad optionally multiplied by lambda
-    def calc_autograd(self, model, loss, lambda_dict=None, calc_norm2_squared=False):
+    def calc_autograd(self, model, loss, calc_norm2_squared=False):
         param_buffer ={}
         for name, param in model.named_parameters():
             param_buffer[name] = param
@@ -80,39 +83,37 @@ class ParameterProcessor:
             norm2_squared = 0.0
             ii = 0
             for name in param_buffer:
-                lambda_value = lambda_dict.get(name, 1.) if lambda_dict is not None else 1.
                 grad = df[ii] #.detach().clone()
-                if lambda_value != 1. :
-                    grad = lambda_value * grad
                 self.grad_current[name] = grad
                 if calc_norm2_squared:
-                    norm2_squared += ((grad)**2).sum()
+                    norm2_squared += ((grad)**2).sum().item() #Check if .item() fine for performance
                 ii += 1
             return norm2_squared
 
 class StepResult:
     def __init__(self, eta, ck_armiho=0.0, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, \
-                 kappa_avg=0.0, grad_norm2_squared=None, cos_phi_sample=None, ratio_sample=None):
+                 kappa_avg=1.0, kappa_min=1.0, grad_norm2_squared=None, cos_phi_sample=None, ratio_sample=None):
         self.eta = eta
         self.ck_armiho = ck_armiho
         self.pq_norm = pq_norm
         self.qq_norm = qq_norm
         self.cos_phi = cos_phi
         self.kappa_avg = kappa_avg
+        self.kappa_min = kappa_min
         self.grad_norm2_squared = grad_norm2_squared
         self.cos_phi_sample = cos_phi_sample
         self.ratio_sample = ratio_sample
 
 class NetLineStepProcessorAbstract:
-    def __init__(self, net, meta, device, lbd_dict=None):
+    def __init__(self, net, meta, device):
         self.net = net
         self.meta = meta
         self.device = device
         self.epsilon = 1e-9
-        self.lbd_dict = lbd_dict
         self.paramProcessor = ParameterProcessor()
         self.do_logging = False #Is additional params logging performed or not, the logging may affect performance
         self.do_calc_armiho = False #Is armiho coeff calculated or not, the calculation may affect performance
+        self.do_calc_grad_norm2 = False #Is norm2 squared of gradient calculated or not, the calculation may affect performance
 
         self.alpha = 0.5 #eta multiplier
         self.beta = 0.00025 #term in eta denom for the eta-calculation stability
@@ -136,7 +137,7 @@ class NetLineStepProcessorAbstract:
                             .format(cos_phi, norm_pq, norm_qq, eta_test, eta_next, self.alpha, self.beta))
             return eta_next, cos_phi
 
-    def softmax(self, logits, meta):
+    def softmax(self, logits):
         with torch.no_grad():
             return (F.softmax(logits, dim=1) + self.epsilon) #.to(meta.device) torch.transpose(, 0, 1)
 
@@ -145,7 +146,6 @@ class NetLineStepProcessorAbstract:
             #return (F.nll_loss(torch.log(torch.transpose(qq, 0, 1)), true_labels, reduction='mean')).item()
             batch_size = pp.shape[0]
             return -torch.sum(torch.log(torch.sum(pp*qq, 1)))/batch_size
-            #return loss.item()
 
     #force_trainmode=True/False
     def do_forward(self, images, force_trainmode):
@@ -161,22 +161,22 @@ class NetLineStepProcessorAbstract:
             return net.forward(images)
 
 class NetLineStepProcessor(NetLineStepProcessorAbstract):
-    def __init__(self, net, meta, device, lbd_dict=None):
-        super().__init__(net, meta, device, lbd_dict)
+    def __init__(self, net, meta, device):
+        super().__init__(net, meta, device)
         #self.internal_criterion = nn.CrossEntropyLoss(reduction='none')
 
     def calc_criterion(self, logits, labels, pp):
         if self.kappa_step_pp <= 0.0:
-            return F.cross_entropy(logits, labels, reduction='mean'), 1.0
+            return F.cross_entropy(logits, labels, reduction='mean'), 1.0, 1.0
         else:
             with torch.no_grad():
                 kappa_raw = 1.0 + self.kappa_step_pp*torch.sum(pp*F.log_softmax(logits, dim=1), dim=1)
                 kappa = torch.maximum(kappa_raw, self.tensor_zero)
-                kappa_avg = torch.mean(kappa)
+                kappa_avg, kappa_min = torch.mean(kappa), torch.min(kappa)
                 if self.do_logging:
-                    logging.info("##Kappa: avg={}, min={}, max={}".format(kappa_avg, torch.min(kappa), torch.max(kappa)))
+                    logging.info("##Kappa: avg={}, min={}, max={}".format(kappa_avg, kappa_min, torch.max(kappa)))
 
-            return torch.mean(kappa*F.cross_entropy(logits, labels, reduction='none')), kappa_avg
+            return torch.mean(kappa*F.cross_entropy(logits, labels, reduction='none')), kappa_avg, kappa_min
 
     """
     step_params:
@@ -200,22 +200,22 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
         net.zero_grad()
         logits = self.do_forward(images, self.dropout_mode) ## new gradient with dropout is generated here (1*)
         logging.info("##Calculating criterion")
-        loss, kappa_avg = self.calc_criterion(logits, labels, pp)
+        loss, kappa_avg, kappa_min = self.calc_criterion(logits, labels, pp)
         logging.info("##Criterion calculated")
-        grad_norm2_squared = self.paramProcessor.calc_autograd(net, loss, self.lbd_dict, True)
+        grad_norm2_squared = self.paramProcessor.calc_autograd(net, loss, self.do_calc_grad_norm2)
         logging.info("##Autograd calculated")
         with torch.no_grad():
             if self.dropout_mode:
                 logits = self.do_forward(images, False) ## all qqxx calculated with dropout off
             #Eta-calculation
-            qq0 = self.softmax(logits, meta) #q(t)
-            qq0_sample = None if sample_images is None else self.softmax(self.do_forward(sample_images, 'train'), meta)
+            qq0 = self.softmax(logits) #q(t)
+            qq0_sample = None if sample_images is None else self.softmax(self.do_forward(sample_images, False))
             #Sample 
             logging.info("##Tmp: Before loss initial")
             #eta_curr = self.eta1 #small step-size
             self.paramProcessor.set_theta(net, momentum, self.eta1, 1.0, weight_decay) #small step
             logits1 = self.do_forward(images, False)
-            qq1 = self.softmax(logits1, meta) #q(tets)
+            qq1 = self.softmax(logits1) #q(tets)
             logging.info("##Tmp: Before eta_analytic_n2")
             delta_pq, delta_qq1 = pp-qq0, qq1-qq0
             norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro')            
@@ -238,7 +238,7 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
             logging.info("##Tmp:1st step finish")
             cos_phi_sample, ratio_sample = None, None
             if (sample_images is not None):
-                qq2_sample = self.softmax(self.do_forward(sample_images, False), meta)
+                qq2_sample = self.softmax(self.do_forward(sample_images, False))
                 #logging.info("##Dims: pp_sample={},qq0_sample={}, qq2_sample={}".format(pp_sample.size(), qq0_sample.size(), qq2_sample.size()))
                 delta_pq_sample, delta_qq2_sample = pp_sample-qq0_sample, qq2_sample-qq0_sample
                 norm_pq_sample, norm_qq2_sample = norm(delta_pq_sample, ord='fro'), norm(delta_qq2_sample, ord='fro')
@@ -250,7 +250,7 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
 
             self.paramProcessor.save_delta_current(momentum, weight_decay)
             logging.info("##Tmp:finish")
-            return StepResult( eta_curr, ck1_armiho, norm_pq, norm_qq1, cos_phi, kappa_avg, grad_norm2_squared\
+            return StepResult( eta_curr, ck1_armiho, norm_pq, norm_qq1, cos_phi, kappa_avg, kappa_min, grad_norm2_squared\
                               , cos_phi_sample, ratio_sample)
 
 class NetLineStepProcessorMSE(NetLineStepProcessorAbstract):
@@ -274,7 +274,7 @@ class NetLineStepProcessorMSE(NetLineStepProcessorAbstract):
         net.zero_grad()
         zz = self.do_forward(xx, 'toss') ## new dropout is generated here (1*)
         loss = self.criterion(zz, yy)
-        self.paramProcessor.calc_autograd(net, loss, self.lbd_dict)
+        self.paramProcessor.calc_autograd(net, loss)
         logging.info("##Autograd calculated")
         with torch.no_grad():
             if self.training_mode:
