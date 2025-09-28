@@ -29,18 +29,22 @@ class ParameterProcessor:
 
     #TODO: slow procedure
     #theta_current must be saved at the current iteration's beginning, delta must be accumulated from previous iterations
-    def set_theta(self, model, momentum, eta, do_save_theta, eta_scale = 1.0):
+    def set_theta(self, model, momentum, eta, is_second_step, eta_scale = 1.0):
         eta_w = eta * eta_scale
         with torch.no_grad():
             for name, param in model.named_parameters():
                 delta = self.delta_current.get(name, None)
                 theta_base = self.theta_current[name]
                 if eta_scale > 0.0:
-                    if do_save_theta:
+                    if is_second_step:
+                        #delta is of this step already
                         self.theta_current[name] = theta_base - eta_w * delta
                         param.data.copy_(self.theta_current[name])
                     else:
-                        param.data.copy_(theta_base - eta_w * delta)
+                        #delta is of prev step yet
+                        grad = self.grad_current.get(name)
+                        delta_no_decay = grad if delta is None or momentum <= 0.0 else momentum*delta + grad
+                        param.data.copy_(theta_base - eta_w * delta_no_decay)
                 else:
                     raise ValueError("eta_scale must be in interval(0., 1.). momentum={}, eta={}, eta_scale={}"\
                                      .format(momentum, eta, eta_scale))
@@ -194,22 +198,21 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
         loss, kappa_avg, kappa_min = self.calc_criterion(logits, labels, pp)
         logging.info("##Criterion calculated")
         norm2_squared_latest = self.paramProcessor.calc_autograd(net, loss, self.do_calc_grad_norm2)
-        norm2_squared_accumulated = self.paramProcessor.save_delta_current(momentum, weight_decay, self.do_calc_grad_norm2)
-        #torch.sqrt(norm2_squared_latest/norm2_squared_accumulated).item() \
-        alpha_shortening = 0.43589 if momentum > 0.0 and self.shorten_grad_accumulated else 1.0
         logging.info("##Autograd calculated")
         with torch.no_grad():
             if self.dropout_mode:
                 logits = self.do_forward(images, False) ## all qqxx calculated with dropout off
             #Eta-calculation
             qq0 = self.softmax(logits) #q(t)
-            #Sample 
             logging.info("##Tmp: Before loss initial")
-            #eta_curr = self.eta1 #small step-size
-            self.paramProcessor.set_theta(net, momentum, self.eta1, do_save_theta=False, eta_scale = 1.0) #small step
-            #logits1 = self.do_forward(images, False)
+            self.paramProcessor.set_theta(net, momentum, self.eta1, is_second_step=False, eta_scale = 1.0) #small step
             qq1 = self.softmax(self.do_forward(images, False))
             delta_pq, delta_qq1 = pp-qq0, qq1-qq0
+
+            #delta is recalc after small step
+            norm2_squared_accumulated = self.paramProcessor.save_delta_current(momentum, weight_decay, self.do_calc_grad_norm2)
+            alpha_shortening = torch.sqrt(norm2_squared_latest/norm2_squared_accumulated).item() \
+                if momentum > 0.0 and self.shorten_grad_accumulated else 1.0
 
             logging.info("##Tmp: Before eta_analytic_n2")
             norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro')
@@ -230,67 +233,9 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
                     logging.info("##--==On step 1: eta_curr={}, eta_next={}, ratio={}, loss_initial={}, loss_next={}, diff_initial={}, diff_next={}, ck1_armiho={} ==--"\
                                 .format(self.eta1, eta2, eta_ratio, loss_initial, loss_next, diff_initial, diff_next, ck1_armiho))
             eta_curr = eta2
-            self.paramProcessor.set_theta(net, momentum, eta_curr, do_save_theta=True, eta_scale = 1.0) #1st step
+            self.paramProcessor.set_theta(net, momentum, eta_curr, is_second_step=True, eta_scale = 1.0) #1st step
             logging.info("##Tmp:1st step finish")
 
             logging.info("##Tmp:finish")
             return StepResult( eta_curr, ck1_armiho, norm_pq, norm_qq1, cos_phi, kappa_avg, kappa_min, self.alpha*alpha_shortening\
                               , norm2_squared_latest, norm2_squared_accumulated)
-
-class NetLineStepProcessorMSE(NetLineStepProcessorAbstract):
-    def __init__(self, net, criterion, meta, device, lbd_dict=None):
-        super().__init__(net, meta, device, lbd_dict) 
-        self.criterion = criterion if criterion is not None else nn.MSELoss()
-
-    """
-    step_params: check_eta2=True/False (default False); set_eta2=True/False (default False)
-    """
-    def step(self, labels, images, momentum = 0.0, step_params = None):
-        net = self.net
-        meta = self.meta
-        xx, yy = images, labels
-        self.paramProcessor.save_theta(net)
-
-        #if momentum > 0.0 and nesterov == True and self.paramProcessor.is_delta_empty() == False:
-        #    self.paramProcessor.set_theta(net, momentum, 0., 0.)
-
-        logging.info("##Calculating params-delta")
-        net.zero_grad()
-        zz = self.do_forward(xx, 'toss') ## new dropout is generated here (1*)
-        loss = self.criterion(zz, yy)
-        self.paramProcessor.calc_autograd(net, loss)
-        logging.info("##Autograd calculated")
-        with torch.no_grad():
-            if self.training_mode:
-                zz = self.do_forward(xx, 'train') ## all qqxx calculated with dropout off
-            #Eta-calculation
-            zz0 = zz
-            loss_initial = self.criterion(yy, zz0)
-            logging.info("##Loss initial:{}".format(loss_initial))
-            self.paramProcessor.set_theta(net, momentum, self.eta1, 1.0) #small step
-            zz1 = self.do_forward(images, 'train') #z(t+1)_test
-            eta_next, eta_raw, norm_yz, norm_zz = self.eta_analytic_n2_onehot(self.eta1, yy, zz0, zz1)
-            eta_ratio = eta_next/(self.eta1 + self.epsilon)
-            logging.info("##--==On step 1 for eta_curr={} eta_next={} with ratio={} ==--".format(self.eta1, eta_next, eta_ratio))
-            eta_curr = eta_next
-            self.paramProcessor.set_theta(net, momentum, eta_curr, 1.0) #1st step
-            if (self.get_param(step_params, 'check_eta2', False) == True or self.get_param(step_params, 'set_eta2', False) == True):
-                zz12 = self.do_forward(images, 'train') #z(t+1)
-                eta_next, _, _, _ = self.eta_analytic_n2_onehot(eta_curr, yy, zz0, zz12)
-                eta_ratio = eta_next/(eta_curr + self.epsilon)
-                logging.info("##--==On step 2 for eta_curr={} eta_next={} with ratio={} ==--".format(eta_curr, eta_next, eta_ratio))
-                if (self.get_param(step_params, 'set_eta2', False) == True):
-                    zz1, eta_curr = zz12, eta_next
-                    self.paramProcessor.set_theta(net, momentum, eta_curr, 1.0) #2st step                    
-
-            eta = self.eta_bounded(eta_curr)
-            if eta != eta_curr:
-                self.paramProcessor.set_theta(net, momentum, eta, 1.0)
-                zz1 = self.do_forward(images, 'train')
-
-        eta_scale, logits, ck1_armiho, ck1_wolf = 1.0, zz1, 1.0, 0.0
-        #Armiho-check is not implemented for MSE-loss
-
-        logging.info("##Eta-value after conditions are applied: {}".format(eta*eta_scale))
-        self.paramProcessor.save_delta_current(momentum, eta, eta_scale)
-        return StepResult(logits, eta*eta_scale, eta_raw, eta_ratio, ck1_armiho, ck1_wolf, norm_yz, norm_zz)
