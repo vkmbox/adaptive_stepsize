@@ -102,15 +102,15 @@ class NetLineStepLR:
                 has_sparse_grad = optimizer._init_group(
                     group, params, grads, momentum_buffer_list
                 )
-                grad_norm2_squared, buffer_norm2_squared = \
-                    torch.tensor(0.0).to(meta.device), torch.tensor(0.0).to(meta.device)
+                grad_norm2_squared, buffer_norm2_squared = 0.0, 0.0
+                    #torch.tensor(0.0).to(meta.device), torch.tensor(0.0).to(meta.device)
                 for num, param in enumerate(params):
                     grad, momentum_buffer = grads[num], momentum_buffer_list[num]
                     vbuff = grad if group["momentum"] == 0 else momentum_buffer
                     param.add_(vbuff, alpha=-eta2_shift)
                     if self.do_calc_grad_norm2:
-                        grad_norm2_squared += (grad**2).sum() #Check if .item() fine for performance
-                        buffer_norm2_squared += (momentum_buffer**2).sum()
+                        grad_norm2_squared += (grad**2).sum().item() #Check if .item() fine for performance
+                        buffer_norm2_squared += (momentum_buffer**2).sum().item()
 
             logging.info("####Snl: step finish, returning step_result")
         return StepResult( eta2, norm_pq, norm_qq1, cos_phi, self.alpha_epoch*alpha_momentum,\

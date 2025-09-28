@@ -111,7 +111,7 @@ class NetLineStepProcessorAbstract:
 
         self.alpha = 0.5 #eta multiplier
         self.beta_min = torch.tensor(0.00001).to(device) #min for eta denom for the eta-calculation stability
-        self.kappa_step_pp = 0.0125 #kappa step per trainpoint
+        self.kappa_step_pp = 0.0 #kappa step per trainpoint
         self.eta1 = 0.00001 #1st step eta-size
         self.tensor_zero = torch.tensor(0.0).to(device)
 
