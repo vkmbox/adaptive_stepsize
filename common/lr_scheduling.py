@@ -76,3 +76,19 @@ def cosine_annealing4_lr(eta0, eta1, eta2, eta3, epoch_cos_pre, epoch_cos_start,
     if epoch_cos_start <= epoch_curr and epoch_curr < epoch_cos_middle:
         return eta2 + 0.5*(eta1-eta2)*(1+math.cos((epoch_curr-epoch_cos_start)*math.pi/(epoch_cos_middle-epoch_cos_start)))
     return eta3 + 0.5*(eta2-eta3)*(1+math.cos((epoch_curr-epoch_cos_middle)*math.pi/(epoch_cos_finish-epoch_cos_middle)))
+
+def cosine_annealing6_lr(eta0, eta1, eta2_1, eta2_2, eta2_3, eta3, epoch_cos_pre, epoch_cos_start\
+                         , epoch_cos_middle1, epoch_cos_middle2, epoch_cos_middle3, epoch_cos_finish, epoch_curr):
+    if epoch_curr < epoch_cos_pre:
+        return eta0
+    if epoch_cos_finish <= epoch_curr:
+        return eta3
+    if epoch_cos_pre <= epoch_curr and epoch_curr < epoch_cos_start:
+        return eta1 + 0.5*(eta0-eta1)*(1+math.cos((epoch_curr-epoch_cos_pre)*math.pi/(epoch_cos_start-epoch_cos_pre)))
+    if epoch_cos_start <= epoch_curr and epoch_curr < epoch_cos_middle1:
+        return eta2_1 + 0.5*(eta1-eta2_1)*(1+math.cos((epoch_curr-epoch_cos_start)*math.pi/(epoch_cos_middle1-epoch_cos_start)))
+    if epoch_cos_middle1 <= epoch_curr and epoch_curr < epoch_cos_middle2:
+        return eta2_2 + 0.5*(eta2_1-eta2_2)*(1+math.cos((epoch_curr-epoch_cos_middle1)*math.pi/(epoch_cos_middle2-epoch_cos_middle1)))
+    if epoch_cos_middle2 <= epoch_curr and epoch_curr < epoch_cos_middle3:
+        return eta2_3 + 0.5*(eta2_2-eta2_3)*(1+math.cos((epoch_curr-epoch_cos_middle2)*math.pi/(epoch_cos_middle3-epoch_cos_middle2)))
+    return eta3 + 0.5*(eta2_3-eta3)*(1+math.cos((epoch_curr-epoch_cos_middle3)*math.pi/(epoch_cos_finish-epoch_cos_middle3)))

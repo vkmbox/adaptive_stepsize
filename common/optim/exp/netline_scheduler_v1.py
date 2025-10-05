@@ -117,10 +117,12 @@ class NetLineStepLR:
             if self.foreach == False:
                 for num, param in enumerate(params):
                     grad, momentum_buffer = grads[num], momentum_buffer_list[num]
-                    vbuff = grad if group["momentum"] == 0 else momentum_buffer
-                    vbuff.mul_(-eta2_shift)
-                    param.add_(vbuff)
-                    #param.add_(vbuff, alpha=-eta2_shift)
+                    buffer_x_shift = None
+                    if group["momentum"] == 0:
+                        buffer_x_shift = grad.mul(-eta2_shift)
+                    else:
+                        buffer_x_shift = momentum_buffer.mul(-eta2_shift)
+                    param.add_(buffer_x_shift)
                     #TODO: norm calculation drops performance, slow operation
                     if self.do_calc_grad_norm2:
                         grad_norm2_squared += (grad**2).sum().item() #Check if .item() fine for performance
