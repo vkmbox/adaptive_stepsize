@@ -104,7 +104,7 @@ class NetLineStepLR:
             logging.info("##Snl: alpha_epoch={}, alpha_momentum={}, eta2={}".format(self.alpha_epoch, alpha_momentum, eta2))
         logging.info("##Snl: shifting params to the rest of step")
         eta2_shift = eta2 - self.eta1
-        grad_norm2_squared, buffer_norm2_squared = 0.0, 0.0
+        grad_norm2_squared, buffer_norm2_squared = torch.tensor(0.0).to(meta.device), torch.tensor(0.0).to(meta.device)
 
         for group in optimizer.param_groups:
             params: List[Tensor] = []
@@ -125,8 +125,8 @@ class NetLineStepLR:
                     param.add_(buffer_x_shift)
                     #TODO: norm calculation drops performance, slow operation
                     if self.do_calc_grad_norm2:
-                        grad_norm2_squared += (grad**2).sum().item() #Check if .item() fine for performance
-                        buffer_norm2_squared += (momentum_buffer**2).sum().item()
+                        grad_norm2_squared += (grad**2).sum() #.item() #Check if .item() fine for performance
+                        buffer_norm2_squared += (momentum_buffer**2).sum() #.item()
 
             else:
                 buffers_x_shift = None
@@ -141,9 +141,9 @@ class NetLineStepLR:
                 #TODO: norm calculation drops performance, slow operation
                 if self.do_calc_grad_norm2:
                     for grad_ in torch._foreach_pow(grads, 2.0):
-                        grad_norm2_squared += grad_.sum().item()
+                        grad_norm2_squared += grad_.sum() #.item()
                     for momentum_ in torch._foreach_pow(momentum_buffer_list, 2.0):
-                        buffer_norm2_squared += momentum_.sum().item()
+                        buffer_norm2_squared += momentum_.sum() #.item()
 
         logging.info("####Snl: step finish, returning step_result")
         return StepResult( eta2, norm_pq, norm_qq1, cos_phi, self.alpha_epoch*alpha_momentum,\

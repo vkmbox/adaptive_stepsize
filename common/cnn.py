@@ -62,6 +62,7 @@ class ResNet9(nn.Module):
 def make_resnet9(in_channels, num_classes):
   return ResNet9(in_channels, num_classes)
 
+'''
 def shortcut_block(in_channels, out_channels):
     return nn.Sequential(
         nn.Conv2d(in_channels, out_channels, kernel_size=2, stride=2, bias=False),
@@ -107,6 +108,7 @@ class ResNet18(nn.Module):
 
 def make_resnet18(in_channels, num_classes):
     return ResNet18(in_channels=in_channels, num_classes=num_classes)
+'''
 
 def modify_torchvision_resnet(resnet):
     '''modify torchvision's resnet18 to better suit cifar10'''
