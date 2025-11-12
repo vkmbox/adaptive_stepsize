@@ -103,8 +103,8 @@ class NetLineStepLR:
         if self.do_logging:
             logging.info("##Snl: alpha_epoch={}, alpha_momentum={}, eta2={}".format(self.alpha_epoch, alpha_momentum, eta2))
         logging.info("##Snl: shifting params to the rest of step")
-        eta2_shift = eta2 - self.eta1
-        grad_norm2_squared, buffer_norm2_squared = torch.tensor(0.0).to(meta.device), torch.tensor(0.0).to(meta.device)
+        eta2_shift = eta2.add(-self.eta1)
+        grad_norm2_squared, buffer_norm2_squared = 0.0, 0.0
 
         for group in optimizer.param_groups:
             params: List[Tensor] = []

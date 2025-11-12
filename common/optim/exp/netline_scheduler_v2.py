@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import math
 import logging
+import statistics
 from random import uniform
 
 #force_trainmode=True/False
@@ -32,7 +33,7 @@ def eta(eta_test, delta_pq, delta_qq, norm_pq, norm_qq, epsilon, beta_min, do_lo
 
 def tn(value, device):
     if torch.is_tensor(value):
-        return value.detach().clone().to(device)
+        return value #.detach().clone().to(device)
     return torch.tensor(value).to(device)
 
 class StepResult:
@@ -66,33 +67,75 @@ class NetLineStepLR:
         self.do_logging = False #Is additional params logging performed or not, the logging may affect performance
         self.shortening_lr_for_momentum = False #If momentum > 0, shorten lr by theoretical ratio |g|/|v|
         self.shortening_lr_adjustment_probe = 0.0 #If shortening_lr_for_momentum = True, probe to adjust for real |g|/|v|
-        self.shortening_lr_adjustment_samplesize = 200
+        self.shortening_lr_adjustment_samplesize = 100
+        self.shortening_lr_queue_quantile = 0.5
+        self.shortening_lr_base_value = math.sqrt(1-self.momentum**2)
 
-        self._alpha_momentum = tn(1.0, meta.device)
+        self._alpha_momentum = 1.0
         self._alpha_recalc = False
         self._alpha_momentum_queue = None
         self._alpha_momentum_queue_pos = 0
 
+    '''
     def init_alpha_momentum(self):
         meta = self.meta
-        self._alpha_momentum, self._alpha_recalc = tn(1.0, meta.device), False
+        self._alpha_recalc = False
         if self.momentum > 0.0 and self.shortening_lr_for_momentum:
             self._alpha_momentum = tn(math.sqrt(1-self.momentum**2), meta.device)
             if self.shortening_lr_adjustment_probe > 0.0:
                 self._alpha_momentum_queue = \
                     torch.full((self.shortening_lr_adjustment_samplesize,), self._alpha_momentum).to(meta.device)
+        else:
+            self._alpha_momentum = tn(1.0, meta.device)
+    '''
+    def init_alpha_momentum(self):
+        meta = self.meta
+        self._alpha_recalc = False
+        if self.momentum > 0.0 and self.shortening_lr_for_momentum:
+            self._alpha_momentum = self.shortening_lr_base_value
+            if self.shortening_lr_adjustment_probe > 0.0:
+                self._alpha_momentum_queue = \
+                    torch.full((self.shortening_lr_adjustment_samplesize,), self._alpha_momentum, dtype=torch.float).to(meta.device)
+        else:
+            self._alpha_momentum = 1.0
 
+    '''
     def _recalc_alpha_momentum(self):
         if self._alpha_recalc == False:
             return self._alpha_momentum
         
         meta = self.meta
-        self._alpha_momentum = tn(1.0, meta.device)
         if self.momentum > 0.0 and self.shortening_lr_for_momentum:
-            self._alpha_momentum = tn(math.sqrt(1-self.momentum**2), meta.device)
+            base_value = math.sqrt(1-self.momentum**2)
             if self.shortening_lr_adjustment_probe > 0.0:
                 alpha_fact = torch.mean(self._alpha_momentum_queue)
-                self._alpha_momentum = tn(min((2.0*self._alpha_momentum - alpha_fact), alpha_fact), meta.device)
+                self._alpha_momentum = tn(min((2.0*base_value - alpha_fact), alpha_fact), meta.device)
+            else:
+                self._alpha_momentum = tn(base_value, meta.device)
+        else:
+            self._alpha_momentum = tn(1.0, meta.device)
+
+        self._alpha_recalc = False
+        return self._alpha_momentum
+    '''
+    def _recalc_alpha_momentum(self):
+        if self._alpha_recalc == False:
+            return self._alpha_momentum
+        
+        if self.momentum > 0.0 and self.shortening_lr_for_momentum:
+            #self.shortening_base_value = math.sqrt(1-self.momentum**2)
+            if self.shortening_lr_adjustment_probe > 0.0:
+                #alpha_fact = torch.mean(self._alpha_momentum_queue)
+                #self._alpha_momentum = min((2.0*base_value - alpha_fact), alpha_fact)
+                delta = torch.quantile(self._alpha_momentum_queue, self.shortening_lr_queue_quantile, interpolation='linear') - self.shortening_lr_base_value
+                #if delta <= 0.0:
+                #    self._alpha_momentum = base_value
+                #else:
+                self._alpha_momentum = self.shortening_lr_base_value - delta #- 100*(delta**2)
+            else:
+                self._alpha_momentum = self.shortening_lr_base_value
+        else:
+            self._alpha_momentum = 1.0
 
         self._alpha_recalc = False
         return self._alpha_momentum
@@ -130,16 +173,17 @@ class NetLineStepLR:
         delta_pq, delta_qq1 = pp-qq0, qq1-qq0
 
         logging.info("##Snl: calculating eta_analytic_n2")
-        alpha_momentum = self._recalc_alpha_momentum()
+        alpha_momentum = self._recalc_alpha_momentum() #math.sqrt(1-self.momentum**2)
         norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro') #math.sqrt((delta_pq**2).sum().item()), math.sqrt((delta_qq1**2).sum().item()) #
         eta2_raw, cos_phi = eta(self.eta1, delta_pq, delta_qq1, norm_pq, norm_qq1, self.epsilon, self.beta_min, self.do_logging)
         eta2 = eta2_raw * self.alpha_epoch*alpha_momentum
         if self.do_logging:
             logging.info("##Snl: alpha_epoch={}, alpha_momentum={}, eta2={}".format(self.alpha_epoch, alpha_momentum, eta2))
-        
+
         logging.info("##Snl: shifting params to the rest of step")
-        eta2_shift = eta2 - self.eta1
-        grad_norm2_squared, buffer_norm2_squared = torch.tensor(0.0).to(meta.device), torch.tensor(0.0).to(meta.device)
+        eta2_shift = eta2.add(-self.eta1)
+        grad_norm2_squared, buffer_norm2_squared = 0.0, 0.0
+
         do_lr_adjustment = False
         if self.momentum > 0.0 and self.shortening_lr_for_momentum and self.shortening_lr_adjustment_probe > 0.0:
             do_lr_adjustment = uniform(0, 1) < self.shortening_lr_adjustment_probe
@@ -164,8 +208,8 @@ class NetLineStepLR:
                     param.add_(buffer_x_shift)
                     #TODO: norm calculation drops performance, slow operation
                     if do_lr_adjustment:
-                        grad_norm2_squared += (grad**2).sum() #.item() #Check if .item() fine for performance
-                        buffer_norm2_squared += (momentum_buffer**2).sum() #.item()
+                        grad_norm2_squared += (grad**2).sum() #Check if .item() fine for performance
+                        buffer_norm2_squared += (momentum_buffer**2).sum()
 
             else:
                 buffers_x_shift = None
@@ -180,14 +224,13 @@ class NetLineStepLR:
                 #TODO: norm calculation drops performance, slow operation
                 if do_lr_adjustment:
                     for grad_ in torch._foreach_pow(grads, 2.0):
-                        grad_norm2_squared += grad_.sum() #.item()
+                        grad_norm2_squared += grad_.sum()
                     for momentum_ in torch._foreach_pow(momentum_buffer_list, 2.0):
-                        buffer_norm2_squared += momentum_.sum() #.item()
+                        buffer_norm2_squared += momentum_.sum()
 
         if do_lr_adjustment:
             self._alpha_momentum_queue[self._alpha_momentum_queue_pos] = torch.sqrt(grad_norm2_squared/buffer_norm2_squared)
-            self._alpha_momentum_queue_pos = self._alpha_momentum_queue_pos + 1\
-                if self._alpha_momentum_queue_pos < self.shortening_lr_adjustment_samplesize - 1 else 0
+            self._alpha_momentum_queue_pos = (self._alpha_momentum_queue_pos + 1)%self.shortening_lr_adjustment_samplesize
             self._alpha_recalc = True
 
         logging.info("####Snl: step finish, returning step_result")

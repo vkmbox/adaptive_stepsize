@@ -13,3 +13,7 @@ __pycache__
 /#docs
 /cifar10_restnet9_weighted_graphs.ipynb
 /cifar10_restnet9_comparison_graphs.ipynb
+/common_old
+/cifar100_cnn_comparison.ipynb
+/cifar10_cnn_comparison.ipynb
+/cifar10_restnet9_scheduler.ipynb
