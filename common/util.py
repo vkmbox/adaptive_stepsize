@@ -1,7 +1,5 @@
-import numpy as np
-from scipy.special import softmax
-
-import logging
+import torch
+import torch.nn.functional as F
 
 DATASET_PATH = "./datasets"
 
@@ -22,26 +20,27 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count
 
+def get_meters(num):
+    return [AverageMeter() for _ in range(num)]
+
 def calculate_accuracy(prediction, target):
     # Note that prediction.shape == target.shape == [B, ]
     matching = (prediction == target).float()
     return matching.mean().item()
 
-def calculate_accuracy_np(prediction, target):
-    # Note that prediction.shape == target.shape == [B, ]
-    return np.average(prediction ==target)
+def test_loop(net, dataloader, device):
+    accuracy_meter, loss_meter = get_meters(2)
+    net.train(False)
+    with torch.no_grad():
+        for test_batch in dataloader:
+            images, labels = test_batch
+            images = images.to(device)
+            labels = labels.to(device)
+            logits = net.forward(images)
+            loss = F.cross_entropy(logits, labels)
+            loss_meter.update(loss)
 
-def loss_crossentropy_np(zz_logits, true_labels):
-    batch_size = len(true_labels)
-    qq = softmax(zz_logits, axis=(0)) + 1e-8
-    pp = np.zeros_like(qq)
-    for col in range(batch_size):
-        pp[true_labels[col],col]=1
-    return -np.sum(pp * np.log(qq))/batch_size
-            
-def labels_to_softhot_np(true_labels, output_dim):
-    batch_size = true_labels.shape[0]
-    yy_softhot = np.zeros((output_dim, batch_size))
-    for batch_num in range(batch_size):
-        yy_softhot[true_labels[batch_num], batch_num] = 1.0
-    return yy_softhot
+            prediction = logits.argmax(dim=-1)
+            accuracy_meter.update(calculate_accuracy(prediction, labels))
+
+    return accuracy_meter.avg, loss_meter.avg

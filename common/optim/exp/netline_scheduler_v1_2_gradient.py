@@ -30,7 +30,8 @@ def eta(eta_test, delta_pq, delta_qq, norm_pq, norm_qq, epsilon, beta_min, do_lo
     return eta_next, cos_phi
 
 class StepResult:
-    def __init__(self, eta, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, alpha = None, grad_norm2_squared=None, accum_norm2_squared=None):
+    def __init__(self, eta, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, alpha = None\
+                 , grad_norm2_squared=None, accum_norm2_squared=None, regression_beta = None, alpha_drift = None):
         self.eta = eta
         self.pq_norm = pq_norm
         self.qq_norm = qq_norm
@@ -38,7 +39,10 @@ class StepResult:
         self.alpha = alpha
         self.grad_norm2_squared = grad_norm2_squared
         self.accum_norm2_squared = accum_norm2_squared
+        self.regression_beta = regression_beta
+        self.alpha_drift = alpha_drift
 
+#Gradient bandit version
 class NetLineStepLR:
 
     #Values for lr, momentum and weight_decay are set externally in optimiser
@@ -53,15 +57,94 @@ class NetLineStepLR:
         self.alpha_epoch = 0.9 #eta multiplier
         self.beta_min = torch.tensor(0.00001).to(meta.device) #min for eta denom for the eta-calculation stability
         self.epsilon = 1e-9
+        self.gamma_drift = 0.1
 
         self.dropout_mode = False #Set true if the net uses dropout layers
         self.do_logging = False #Is additional params logging performed or not, the logging may affect performance
         self.do_calc_grad_norm2 = False #Is norm2 squared of gradient calculated or not, the calculation may affect performance
         self.do_shorten_lr_for_momentum = False #If momentum > 0, shorten lr by theoretical ratio |g|/|v|
+        
+        self.alpha_drift_check = True
+        self.alpha_drift_min = 0.5
+        self.alpha_drift_max = 1.2
+        self.alpha_drift_step = 0.1
+        self.regression_queue_size = 50
+        self.regression_betta_multiplier = 1e4
+        self.rewards_buff_size = 100
 
-        self.defaults = dict(
-            differentiable=False,
-        )
+        self._gradient_pref = None #array of preferences Ht
+        self._pref_eye = None
+        self._gradient_prob = None #array of soft-max probabilities Πt
+        self._rewards_buff = None #array of latest rewards Rt
+        self._rewards_buff_pos = [0, 0]
+        self._rf_choice = -1 #latest alternative choice
+
+        self._regression_queue = None
+        self._regression_multipliers = None
+        self._regression_queue_pos = 0
+        self._regression_queue_pos_cyclic = False
+
+    #Regression drift-relared part
+    def init_regression(self):
+        meta = self.meta
+        if self.alpha_drift_check:
+            self._regression_queue_pos = 0
+            self._regression_queue_pos_cyclic = False
+            self._regression_queue = \
+                torch.zeros((self.regression_queue_size,), dtype=torch.float).to(meta.device)
+            self._regression_multipliers = torch.arange(1, self.regression_queue_size + 1, 1).to(meta.device)
+
+    def calc_regression_beta(self, eta):
+        self._regression_queue[self._regression_queue_pos] = eta
+        #pos shift
+        self._regression_queue_pos += 1
+        if self._regression_queue_pos >= self.regression_queue_size:
+            self._regression_queue_pos_cyclic = True
+            self._regression_queue_pos = self._regression_queue_pos - self.regression_queue_size
+
+        shift = self._regression_queue_pos if self._regression_queue_pos_cyclic else 0
+        sum1 = torch.sum(torch.roll(self._regression_multipliers, shift)*self._regression_queue)
+        sum2 = torch.sum(self._regression_queue)
+        return 6*(2*sum1-(self.regression_queue_size+1)*sum2)/(self.regression_queue_size*(self.regression_queue_size**2-1))
+
+    #Gradient bandit-relared part
+    def get_reward(self, beta):
+        return -torch.abs(beta) * self.regression_betta_multiplier
+    
+    def get_state(self, beta):
+        return 0 if beta < 0 else 1
+
+    def init_rf_gradient(self, beta):
+        state = self.get_state(beta)
+        if self._pref_eye is None:
+            self.init_buffers()
+        self._rewards_buff_pos[state] = 0
+        self._rewards_buff[state, self._rewards_buff_pos[state]] = self.get_reward(beta)
+
+    def init_buffers(self):
+        meta = self.meta
+        pref_size = round(((self.alpha_drift_max - self.alpha_drift_min)/self.alpha_drift_step) + 1)
+        self._pref_eye = torch.eye(pref_size, dtype=torch.float, device=meta.device)
+        self._gradient_pref = torch.zeros((2, pref_size), dtype=torch.float, device=meta.device)
+        self._gradient_prob = torch.full((2, pref_size), 1/pref_size, dtype=torch.float, device=meta.device)
+        self._rewards_buff = torch.zeros((2, self.rewards_buff_size), dtype=torch.float, device=meta.device)
+
+    def recalc_rf_gradient(self, beta):
+        state = self.get_state(beta)
+        reward_current = self.get_reward(beta)
+        self._rewards_buff_pos[state] = (self._rewards_buff_pos[state] + 1)%self.rewards_buff_size
+        self._rewards_buff[state, self._rewards_buff_pos[state]] = reward_current
+        rewards_delta = reward_current - torch.mean(self._rewards_buff[state])
+        self._gradient_pref[state] = \
+            self._gradient_pref[state] - \
+                self.gamma_drift*rewards_delta*(self._gradient_prob[state] - self._pref_eye[self._rf_choice])
+        self._gradient_prob[state] = F.softmax(self._gradient_pref[state], dim=0)
+
+    def select_alpha_drift(self, beta):
+        meta = self.meta
+        state = self.get_state(beta)
+        self._rf_choice = torch.searchsorted(self._gradient_prob[state].cumsum(0), torch.rand(1).to(meta.device))[0]
+        return self.alpha_drift_min + self.alpha_drift_step*self._rf_choice
 
     def step(self, labels, images):
         net = self.net
@@ -100,7 +183,22 @@ class NetLineStepLR:
         logging.info("##Snl: calculating eta_analytic_n2")
         norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro') #math.sqrt((delta_pq**2).sum().item()), math.sqrt((delta_qq1**2).sum().item()) #
         eta2_raw, cos_phi = eta(self.eta1, delta_pq, delta_qq1, norm_pq, norm_qq1, self.epsilon, self.beta_min, self.do_logging)
-        eta2 = eta2_raw * self.alpha_epoch*alpha_momentum
+
+        alpha_drift = 1.0
+        if self.alpha_drift_check:
+            regression_beta = self.calc_regression_beta(eta2_raw)
+            if self.do_logging:
+                logging.info("##Snl: regression_beta={}".format(regression_beta))
+            state = self.get_state(regression_beta)
+            if self._rf_choice < 0:
+                self.init_rf_gradient(regression_beta)
+            else:
+                self.recalc_rf_gradient(regression_beta)
+
+            alpha_drift = self.select_alpha_drift(regression_beta)
+
+            #torch.minimum(torch.maximum(1.0 - self.calc_regression_adjustment(regression_beta), self.alpha_drift_min), self.alpha_drift_max)
+        eta2 = eta2_raw*self.alpha_epoch*alpha_momentum*alpha_drift
         if self.do_logging:
             logging.info("##Snl: alpha_epoch={}, alpha_momentum={}, eta2={}".format(self.alpha_epoch, alpha_momentum, eta2))
         logging.info("##Snl: shifting params to the rest of step")
@@ -147,5 +245,5 @@ class NetLineStepLR:
                         buffer_norm2_squared += momentum_.sum() #.item()
 
         logging.info("####Snl: step finish, returning step_result")
-        return StepResult( eta2, norm_pq, norm_qq1, cos_phi, self.alpha_epoch*alpha_momentum,\
-                            grad_norm2_squared, buffer_norm2_squared)
+        return StepResult( eta2, norm_pq, norm_qq1, cos_phi, self.alpha_epoch*alpha_momentum*alpha_drift,\
+                            grad_norm2_squared, buffer_norm2_squared, regression_beta, alpha_drift)

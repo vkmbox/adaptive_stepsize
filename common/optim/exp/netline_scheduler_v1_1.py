@@ -30,7 +30,8 @@ def eta(eta_test, delta_pq, delta_qq, norm_pq, norm_qq, epsilon, beta_min, do_lo
     return eta_next, cos_phi
 
 class StepResult:
-    def __init__(self, eta, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, alpha = None, grad_norm2_squared=None, accum_norm2_squared=None):
+    def __init__(self, eta, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, alpha = None\
+                 , grad_norm2_squared=None, accum_norm2_squared=None, regression_beta = None, alpha_drift = None):
         self.eta = eta
         self.pq_norm = pq_norm
         self.qq_norm = qq_norm
@@ -38,6 +39,8 @@ class StepResult:
         self.alpha = alpha
         self.grad_norm2_squared = grad_norm2_squared
         self.accum_norm2_squared = accum_norm2_squared
+        self.regression_beta = regression_beta
+        self.alpha_drift = alpha_drift
 
 class NetLineStepLR:
 
@@ -58,10 +61,48 @@ class NetLineStepLR:
         self.do_logging = False #Is additional params logging performed or not, the logging may affect performance
         self.do_calc_grad_norm2 = False #Is norm2 squared of gradient calculated or not, the calculation may affect performance
         self.do_shorten_lr_for_momentum = False #If momentum > 0, shorten lr by theoretical ratio |g|/|v|
+        
+        self.lr_drift_check = True
+        self.lr_drift_size = 50
+        self.lr_drift_coeff = 1e3
+        self.lr_drift_base = -5e-3
+        self.alpha_drift_min = torch.tensor(0.25).to(meta.device)
+        self.alpha_drift_max = torch.tensor(1.25).to(meta.device)
+        self._lr_drift_queue = None
+        self._lr_drift_multipliers = None
+        self._lr_drift_queue_pos = 0
+        self._lr_drift_queue_pos_cyclic = False
 
-        self.defaults = dict(
-            differentiable=False,
-        )
+    def init_lr_drift_checker(self):
+        meta = self.meta
+        if self.lr_drift_check:
+            self._lr_drift_queue_pos = 0
+            self._lr_drift_queue_pos_cyclic = False
+            self._lr_drift_queue = \
+                torch.zeros((self.lr_drift_size,), dtype=torch.float).to(meta.device)
+            self._lr_drift_multipliers = torch.arange(1, self.lr_drift_size + 1, 1).to(meta.device)
+
+    def calc_regression_beta(self, eta):
+        self._lr_drift_queue[self._lr_drift_queue_pos] = eta
+
+        #pos shift
+        self._lr_drift_queue_pos += 1
+        if self._lr_drift_queue_pos >= self.lr_drift_size:
+            self._lr_drift_queue_pos_cyclic = True
+            self._lr_drift_queue_pos = self._lr_drift_queue_pos - self.lr_drift_size
+
+        shift = self._lr_drift_queue_pos if self._lr_drift_queue_pos_cyclic else 0
+        sum1 = torch.sum(torch.roll(self._lr_drift_multipliers, shift)*self._lr_drift_queue)
+        sum2 = torch.sum(self._lr_drift_queue)
+        return 6*(2*sum1-(self.lr_drift_size+1)*sum2)/(self.lr_drift_size*(self.lr_drift_size**2-1))
+
+    '''
+        self.lr_drift_coeff = 1e3
+        self.lr_drift_base = -5e-3
+    '''
+    def calc_regression_adjustment(self, beta):
+        #1 -(exp(20*x)-1)/10
+        return (torch.exp(20.0*(beta*self.lr_drift_coeff - self.lr_drift_base)) - 1.0)/10.0
 
     def step(self, labels, images):
         net = self.net
@@ -100,7 +141,12 @@ class NetLineStepLR:
         logging.info("##Snl: calculating eta_analytic_n2")
         norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro') #math.sqrt((delta_pq**2).sum().item()), math.sqrt((delta_qq1**2).sum().item()) #
         eta2_raw, cos_phi = eta(self.eta1, delta_pq, delta_qq1, norm_pq, norm_qq1, self.epsilon, self.beta_min, self.do_logging)
-        eta2 = eta2_raw * self.alpha_epoch*alpha_momentum
+        regression_beta = 0.0 if not self.lr_drift_check else self.calc_regression_beta(eta2_raw)
+        if self.do_logging:
+            logging.info("##Snl: regression_beta={}".format(regression_beta))
+        alpha_drift = torch.minimum(torch.maximum(1.0 - self.calc_regression_adjustment(regression_beta), self.alpha_drift_min)\
+                                    , self.alpha_drift_max)
+        eta2 = eta2_raw*self.alpha_epoch*alpha_momentum*alpha_drift
         if self.do_logging:
             logging.info("##Snl: alpha_epoch={}, alpha_momentum={}, eta2={}".format(self.alpha_epoch, alpha_momentum, eta2))
         logging.info("##Snl: shifting params to the rest of step")
@@ -147,5 +193,5 @@ class NetLineStepLR:
                         buffer_norm2_squared += momentum_.sum() #.item()
 
         logging.info("####Snl: step finish, returning step_result")
-        return StepResult( eta2, norm_pq, norm_qq1, cos_phi, self.alpha_epoch*alpha_momentum,\
-                            grad_norm2_squared, buffer_norm2_squared)
+        return StepResult( eta2, norm_pq, norm_qq1, cos_phi, self.alpha_epoch*alpha_momentum*alpha_drift,\
+                            grad_norm2_squared, buffer_norm2_squared, regression_beta, alpha_drift)

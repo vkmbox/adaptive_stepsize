@@ -1,7 +1,9 @@
 __pycache__
 /datasets
 /logs
-/#11
+/run_data
+/run_logs
+/run_pic
 /#saves
 /#save
 /dynamic_module/target
