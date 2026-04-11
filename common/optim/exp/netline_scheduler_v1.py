@@ -51,7 +51,8 @@ class NetLineStepLR:
 
         self.eta1 = optimizer.param_groups[0]['lr'] #1st step eta-size
         self.alpha_epoch = 0.9 #eta multiplier
-        self.beta_min = torch.tensor(0.00001).to(meta.device) #min for eta denom for the eta-calculation stability
+        self.beta_min = torch.tensor(0.00000001).to(meta.device) #min for eta denom for the eta-calculation stability
+        self.eta_max = torch.tensor(1e-1).to(meta.device)
         self.epsilon = 1e-9
 
         self.dropout_mode = False #Set true if the net uses dropout layers
@@ -101,6 +102,7 @@ class NetLineStepLR:
         norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro') #math.sqrt((delta_pq**2).sum().item()), math.sqrt((delta_qq1**2).sum().item()) #
         eta2_raw, cos_phi = eta(self.eta1, delta_pq, delta_qq1, norm_pq, norm_qq1, self.epsilon, self.beta_min, self.do_logging)
         eta2 = eta2_raw * self.alpha_epoch*alpha_momentum
+        eta2 = torch.minimum(eta2, self.eta_max)
         if self.do_logging:
             logging.info("##Snl: alpha_epoch={}, alpha_momentum={}, eta2={}".format(self.alpha_epoch, alpha_momentum, eta2))
         logging.info("##Snl: shifting params to the rest of step")
