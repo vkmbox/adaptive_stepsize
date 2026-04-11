@@ -61,22 +61,23 @@ class NetLineStepLR:
         self.do_logging = False #Is additional params logging performed or not, the logging may affect performance
         self.do_calc_grad_norm2 = False #Is norm2 squared of gradient calculated or not, the calculation may affect performance
         self.do_shorten_lr_for_momentum = False #If momentum > 0, shorten lr by theoretical ratio |g|/|v|
-        
+
         self.alpha_drift_check = True
-        self.regression_queue_size = 50
-        self.alpha_drift_min = torch.tensor(0.5, device=meta.device)
-        self.alpha_drift_max = torch.tensor(1.2, device=meta.device)
-        self.alpha_drift_init = 0.75
-        self.pid_coeff_linear = 5.0
-        self.pid_coeff_integral = 1.0
-        #self.pid_delta_scale = 1e5
-        self.pid_base = 0
-        self.coeff_delta_asc = 2.0
-        self.coeff_delta_desc = 1.0
+        self.regression_queue_size = 100
+        self.alpha_drift_min = torch.tensor(0.25, device=meta.device)
+        self.alpha_drift_max = torch.tensor(1.25, device=meta.device)
+        self.alpha_drift_init = torch.tensor(0.75, device=meta.device)
+        self.pid_coeff_linear = 2e2
+        self.pid_coeff_integral = 2.0
+        self.pid_coeff_diff = 1.0
+        self.pid_base = torch.tensor(0.0, device=meta.device)
+        #self.coeff_delta_asc = 1.0
+        #self.coeff_delta_desc = 1.0
         self.delta_zero = False
 
-        self._alpha_drift = .0 #latest control signal u(t) value
-        self._control_delta = .0 #latest control delta e(t) value
+        self._alpha_drift = None #latest control signal u(t) value
+        self._control_delta = None #latest control delta e(t) value
+        self._control_delta_prev = None #latest control delta e(t-1) value
 
         self._regression_queue = None
         self._regression_multipliers = None
@@ -112,29 +113,27 @@ class NetLineStepLR:
     def get_control_delta(self, beta):
         if self.delta_zero:
             return self._zero_tenzor
-        delta = self.pid_base - beta
-        if delta > 0.0:
-            return delta * self.coeff_delta_asc
-        else:
-            return delta * self.coeff_delta_desc
+        return self.pid_base.sub(beta)
 
-    '''
-    self.alpha_drift_min = 0.5
-    self.alpha_drift_max = 1.2
-    self.pid_coeff_linear = 0.5
-    self.pid_coeff_integral = 0.1
-    self._alpha_drift = .0 #latest control signal u(t) value
-    self._control_delta = .0 #latest control delta e(t) value
-    '''
     def select_alpha_drift(self, beta):
         control_delta_new = self.get_control_delta(beta)
-        if (self._alpha_drift <= .0):
+        if (self._alpha_drift is None):
             self._alpha_drift = self.alpha_drift_init
-            self._control_delta = 0.0
+            self._control_delta = self._zero_tenzor
+            self._control_delta_prev = self._zero_tenzor
 
-        alpha_drift_new = self._alpha_drift + self.pid_coeff_integral * control_delta_new + \
-            self.pid_coeff_linear * (control_delta_new - self._control_delta)
-        
+        '''
+        alpha_drift_new = self._alpha_drift + self.pid_coeff_integral * control_delta_new
+        alpha_drift_new = alpha_drift_new + self.pid_coeff_linear * (control_delta_new - self._control_delta)
+        alpha_drift_new = alpha_drift_new + self.pid_coeff_diff * (control_delta_new - 2*self._control_delta + self._control_delta_prev)
+        '''
+        delta = control_delta_new.sub(self._control_delta)
+        delta_prev = self._control_delta.sub(self._control_delta_prev)
+        alpha_drift_new = self._alpha_drift.add(control_delta_new, alpha=self.pid_coeff_integral)
+        alpha_drift_new.add_(delta, alpha=self.pid_coeff_linear)
+        alpha_drift_new.add_(delta.sub(delta_prev), alpha=self.pid_coeff_diff)
+
+        self._control_delta_prev = self._control_delta
         self._control_delta = control_delta_new
         self._alpha_drift = \
             torch.minimum(torch.maximum(alpha_drift_new, self.alpha_drift_min), self.alpha_drift_max)
@@ -178,7 +177,7 @@ class NetLineStepLR:
         norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro') #math.sqrt((delta_pq**2).sum().item()), math.sqrt((delta_qq1**2).sum().item()) #
         eta2_raw, cos_phi = eta(self.eta1, delta_pq, delta_qq1, norm_pq, norm_qq1, self.epsilon, self.beta_min, self.do_logging)
 
-        alpha_drift = 1.0
+        alpha_drift, regression_beta = 1.0, 0.0
         if self.alpha_drift_check:
             regression_beta = self.calc_regression_beta(eta2_raw)
             if self.do_logging:

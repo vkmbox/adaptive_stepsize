@@ -37,8 +37,13 @@ DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 meta = MetaData(batch_size = BATCH_SIZE, output_dim=OUTPUT_DIM, device=DEVICE)
 
 EXPERIMENTS = 2
-EPOCHS_PER_EXPERIMENT = 2 #50
+EPOCHS_PER_EXPERIMENT = 2#50
 DATASET_PATH = "./datasets"
+ALPHA_DATASET=0.975
+
+#Values validation
+if EPOCHS_PER_EXPERIMENT < 1:#40:
+    raise ValueError("Incorrect dataset setting:{}, must be >= 40".format(EPOCHS_PER_EXPERIMENT))
 
 #Manual seed
 seed_value= 641
@@ -91,17 +96,6 @@ elif EXP_DATASET == 'SVHN':
 else:
     raise ValueError("Incorrect dataset setting:"+EXP_DATASET)
 
-#NET
-net_base = None
-if EXP_NET == 'RESNET9':
-    net_base = make_resnet9(3, OUTPUT_DIM).to(DEVICE)
-elif EXP_NET == 'RESNET18':
-    net_base = make_resnet18v2(3, OUTPUT_DIM).to(DEVICE)
-elif EXP_NET == 'RESNET34':
-    net_base = make_resnet34v2(3, OUTPUT_DIM).to(DEVICE)
-else:
-    raise ValueError("Incorrect net setting:"+EXP_NET)
-
 #EXPERIMENTS
 '''
 0-num of experiment; 1-epoch;
@@ -116,7 +110,18 @@ idx_adam, idx_nl, idx_sgd = 0, 1, 2
 
 print("Start of a series of {} experiments".format(EXPERIMENTS))
 for experiment in range(EXPERIMENTS):
+    #NET
+    net_base = None
+    if EXP_NET == 'RESNET9':
+        net_base = make_resnet9(3, OUTPUT_DIM).to(DEVICE)
+    elif EXP_NET == 'RESNET18':
+        net_base = make_resnet18v2(3, OUTPUT_DIM).to(DEVICE)
+    elif EXP_NET == 'RESNET34':
+        net_base = make_resnet34v2(3, OUTPUT_DIM).to(DEVICE)
+    else:
+        raise ValueError("Incorrect net setting:"+EXP_NET)
     net_adam, net_snl, net_sgd = net_base, copy.deepcopy(net_base), copy.deepcopy(net_base)
+
     #Adam
     loss_adam = nn.CrossEntropyLoss()
     opt_adam = torch.optim.AdamW(net_adam.parameters(), lr=0.001, weight_decay=0.1)
@@ -141,7 +146,7 @@ for experiment in range(EXPERIMENTS):
         mt_alpha, mt_adam, mt_netline, mt_sgd, mt_qq, mt_pq, mt_cos, mt_eta, mt_alpha_drift, mt_drift = get_meters(10)
 
         #alpha for net-line
-        snl_sch.alpha_epoch = 0.975*line_annealing4_lr(0.7, 0.95, 1.0, 0.0, 0, 15, 35, 50, epoch)
+        snl_sch.alpha_epoch = ALPHA_DATASET*line_annealing4_lr(0.7, 0.95, 1.0, 0.0, 0, 15, EPOCHS_PER_EXPERIMENT - 15, EPOCHS_PER_EXPERIMENT, epoch)
 
         net_adam.train(True)
         net_snl.train(True)

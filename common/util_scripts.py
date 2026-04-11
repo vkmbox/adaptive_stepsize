@@ -124,7 +124,7 @@ def accuracy_comparison(exp_results, epochs_per_experiment, title="Validation ac
     sgd_mean, sgd_var = np.mean(exp_results[:, :, 2, 0], axis=0), np.var(exp_results[:, :, 2, 0], axis=0)
 
     p1, p2, p3, p4, p5 = min(10, epochs_per_experiment), min(20, epochs_per_experiment), min(30, epochs_per_experiment)\
-        , min(40, epochs_per_experiment), min(50, epochs_per_experiment)
+        , min(75, epochs_per_experiment-10), min(100, epochs_per_experiment)
 
     report = np.zeros((3,5), dtype='U256')
     for row in range(3):
