@@ -29,11 +29,10 @@ def eta(eta_test, delta_pq, delta_qq, norm_pq, norm_qq, epsilon, beta_min, do_lo
     return eta_next, cos_phi
 
 class StepResult:
-    def __init__(self, eta, eta_q = 0.0, eta_y = 0.0, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, alpha = None\
+    def __init__(self, eta, eta2_pre=0.0, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, alpha = None\
                  , grad_norm2_squared=None, accum_norm2_squared=None, regression_beta = None, alpha_drift = None):
         self.eta = eta
-        self.eta_q = eta_q
-        self.eta_y = eta_y
+        self.eta2_pre = eta2_pre
         self.pq_norm = pq_norm
         self.qq_norm = qq_norm
         self.cos_phi = cos_phi
@@ -63,7 +62,6 @@ class NetLineStepLR:
         self.do_logging = False #Is additional params logging performed or not, the logging may affect performance
         self.do_calc_grad_norm2 = False #Is norm2 squared of gradient calculated or not, the calculation may affect performance
         self.do_shorten_lr_for_momentum = False #If momentum > 0, shorten lr by theoretical ratio |g|/|v|
-        self.use_y = 0.0
 
         self.lr_drift_check = True
         self.lr_drift_size = 500
@@ -166,10 +164,12 @@ class NetLineStepLR:
         qq1 = F.softmax(logits1, dim=1) #0-point, 1-neuron?
         delta_pq, delta_qq1 = pp-qq0, qq1-qq0
 
+        '''
         logging.info("##Snl: calculating eta_preactivation")
         dz = (logits1-logits0)/eta1
         qqq = qq0[:,:,None]*(self._eye[None,:,:]-qq0[:,None,:])
         eta2_raw_y = torch.squeeze(torch.sum(delta_pq*dz)/torch.sum(dz[:,:,None]*qqq*dz[:,None,:]))
+        '''
 
         logging.info("##Snl: calculating eta_analytic_n2")
         norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro')
@@ -182,15 +182,14 @@ class NetLineStepLR:
             alpha_drift = \
                 torch.minimum(torch.maximum(self.calc_regression_adjustment(regression_beta), self.alpha_drift_min), self.alpha_drift_max)
         if second_step:
-            eta2_q = eta2_raw*self.alpha_epoch*alpha_momentum*alpha_drift
-            eta2_y = eta2_raw_y*self.alpha_epoch*alpha_momentum*alpha_drift
-            eta2_pre = eta2_y * self.use_y + eta2_q * (1.0 - self.use_y)
+            eta2_pre = eta2_raw*self.alpha_epoch*alpha_momentum*alpha_drift
+            #eta2_y = eta2_raw_y*self.alpha_epoch*alpha_momentum*alpha_drift
+            #eta2_pre = eta2_y * self.use_y + eta2_q * (1.0 - self.use_y)
             eta2 = self.calc_averaging(eta2_pre)
         else:
-            eta2 = eta1
-            eta2_q = eta2_y = eta2
+            eta2 = eta2_pre = eta1
         if self.do_logging:
-            logging.info("##Snl: alpha_epoch={}, alpha_momentum={}, eta2_q={}, eta2_y={}".format(self.alpha_epoch, alpha_momentum, eta2_q, eta2_y))
+            logging.info("##Snl: alpha_epoch={}, alpha_momentum={}, eta2_pre={}, eta2={}".format(self.alpha_epoch, alpha_momentum, eta2_pre, eta2))
         logging.info("##Snl: shifting params to the rest of step")
         grad_norm2_squared, buffer_norm2_squared = 0.0, 0.0
 
@@ -236,5 +235,5 @@ class NetLineStepLR:
                             buffer_norm2_squared += momentum_.sum() #.item()
 
         logging.info("####Snl: step finish, returning step_result")
-        return StepResult( eta2, eta2_q, eta2_y, norm_pq, norm_qq1, cos_phi, self.alpha_epoch*alpha_momentum*alpha_drift,\
+        return StepResult( eta2, eta2_pre, norm_pq, norm_qq1, cos_phi, self.alpha_epoch*alpha_momentum*alpha_drift,\
                             grad_norm2_squared, buffer_norm2_squared, regression_beta, alpha_drift)
