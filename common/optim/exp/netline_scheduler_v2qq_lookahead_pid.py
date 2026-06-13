@@ -3,6 +3,7 @@ from torch import Tensor, nn
 from torch.linalg import norm
 import torch.nn.functional as F
 from typing import List, Optional
+from collections import defaultdict
 
 import math
 import logging
@@ -30,7 +31,7 @@ def eta(eta_test, delta_pq, delta_qq, norm_pq, norm_qq, epsilon, beta_min, do_lo
 
 class StepResult:
     def __init__(self, eta, eta2_pre=0.0, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, alpha = None\
-                 , grad_norm2_squared=None, accum_norm2_squared=None, regression_beta = None, alpha_drift = None, qmax = None):
+                 , grad_norm2_squared=None, accum_norm2_squared=None, regression_beta = None, alpha_drift = None):
         self.eta = eta
         self.eta2_pre = eta2_pre
         self.pq_norm = pq_norm
@@ -41,12 +42,11 @@ class StepResult:
         self.accum_norm2_squared = accum_norm2_squared
         self.regression_beta = regression_beta
         self.alpha_drift = alpha_drift
-        self.qmax = qmax
 
 class NetLineStepLR:
 
     #Values for lr, momentum and weight_decay are set externally in optimiser
-    def __init__(self, net, optimizer, meta, foreach=False, loss_fn=None):
+    def __init__(self, net, optimizer, meta, la_steps=5, la_alpha=0.8, foreach=False, loss_fn=None):
         self.net = net
         self.optimizer = optimizer
         self.meta = meta
@@ -66,8 +66,17 @@ class NetLineStepLR:
 
         self.lr_drift_check = True
         self.lr_drift_size = 500
-        self.lr_drift_pos = 5.0
-        self.lr_drift_neg = 2.0
+        self.lr_drift_pos_p = 5.0
+        self.lr_drift_pos_i = 0.1
+        self.lr_drift_pos_d = 1.0
+        self.lr_drift_neg = 0.0
+        self._lr_drift_un = 0.0
+        self._lr_drift_un_1 = 0.0
+        self._lr_drift_en = 0.0
+        self._lr_drift_en_1 = 0.0
+        self._lr_drift_en_2 = 0.0
+
+        self._zero = torch.tensor(0.0).to(meta.device)
         self.alpha_drift_min = torch.tensor(0.75).to(meta.device)
         self.alpha_drift_max = torch.tensor(1.25).to(meta.device)
         self._lr_drift_queue = None
@@ -80,10 +89,36 @@ class NetLineStepLR:
         self._lr_averaging_queue_pos = 0
         self._lr_averaging_queue_pos_cyclic = False
 
-        self.check_qmax = False
-        self._qmax = torch.tensor(0.975).to(meta.device)
-        self.__one = torch.tensor(1.0).to(meta.device)
-        self.__zero = torch.tensor(0.0).to(meta.device)
+        self.la_alpha = la_alpha
+        self._la_step = 0  # counter for inner optimizer
+        self._total_la_steps = la_steps
+        self.la_state: List[Tensor] = []
+        self.la_backup: List[Tensor] = []
+
+    def init_lookahead(self):
+        # Cache the current optimizer parameters params.append(p)
+        for group in self.optimizer.param_groups:
+            for param in group['params']:
+                param_state = torch.zeros_like(param)
+                param_state.copy_(param)
+                self.la_state.append(param_state)
+
+    def _backup_and_load_cache(self):
+        """Useful for performing evaluation on the slow weights (which typically generalize better)
+        """
+        self.la_backup.clear()
+        for group in self.optimizer.param_groups:
+            for num, param in enumerate(group['params']):
+                backup_params = torch.zeros_like(param.data)
+                backup_params.copy_(param.data)
+                self.la_backup.append(backup_params)
+                param.data.copy_(self.la_state[num])
+
+    def _clear_and_load_backup(self):
+        for group in self.optimizer.param_groups:
+            for num, param in enumerate(group['params']):
+                param.data.copy_(self.la_backup[num])
+        self.la_backup.clear()
 
     def init_averaging(self):
         meta = self.meta
@@ -133,7 +168,16 @@ class NetLineStepLR:
         return 6*(2*sum1-(self.lr_drift_size+1)*sum2)/(self.lr_drift_size*(self.lr_drift_size**2-1))
 
     def calc_regression_adjustment(self, beta):
-        return 1.0 + torch.where(beta < 0.0, beta*self.lr_drift_neg, beta*self.lr_drift_pos)
+        self._lr_drift_en_2 = self._lr_drift_en_1
+        self._lr_drift_en_1 = self._lr_drift_en
+        self._lr_drift_en = beta #torch.where(beta < 0.0, beta*0.2, beta)
+        self._lr_drift_un_1 = self._lr_drift_un
+        # U(n)=U(n-1)+K_{i}^{discr}{E(n)}+K_{p}(E(n)-E(n-1))+K_{d}^{discr}(E(n)-2E(n-1)+E(n-2))
+        #torch.where(beta < 0.0, beta*self.lr_drift_neg,
+        self._lr_drift_un = self._lr_drift_un_1 + self.lr_drift_pos_i*self._lr_drift_en + self.lr_drift_pos_p*(self._lr_drift_en - self._lr_drift_en_1) + \
+                self.lr_drift_pos_d*(self._lr_drift_en - 2*self._lr_drift_en_1 + self._lr_drift_en_2)
+        
+        return 1.0 + torch.maximum(self._lr_drift_un, self._zero)
 
     def step(self, labels, images, second_step):
         net = self.net
@@ -145,16 +189,8 @@ class NetLineStepLR:
         net.zero_grad()
         logitsG = snl_forward(net, images, self.dropout_mode) ## new gradient with dropout is generated here (1*)
         logging.info("##Snl: calculating criterion")
-        if self.check_qmax:
-            label_smoothing = self.__one.sub(self._qmax)
-            if torch.equal(self.__zero, label_smoothing):
-                loss_fn = nn.CrossEntropyLoss(reduction='mean')
-            else:
-                loss_fn = nn.CrossEntropyLoss(reduction='mean', label_smoothing=self.__one.sub(self._qmax))
-        else:
-            loss_fn = self.loss_fn
 
-        loss = loss_fn.forward(logitsG, labels)
+        loss = self.loss_fn.forward(logitsG, labels)
         logging.info("##Snl: performing small step")
         loss.backward()
         optimizer.step()
@@ -178,8 +214,6 @@ class NetLineStepLR:
         logits1 = snl_forward(net, images, False)
         qq1 = F.softmax(logits1, dim=1) #0-point, 1-neuron?
         delta_pq, delta_qq1 = pp-qq0, qq1-qq0
-        if self.check_qmax:
-            self._qmax = torch.maximum(torch.max(qq0), self._qmax)
 
         '''
         logging.info("##Snl: calculating eta_preactivation")
@@ -210,18 +244,22 @@ class NetLineStepLR:
         logging.info("##Snl: shifting params to the rest of step")
         grad_norm2_squared, buffer_norm2_squared = 0.0, 0.0
 
-        if second_step:
-            eta2_shift = eta2.add(-eta1)
-            for group in optimizer.param_groups:
-                params: List[Tensor] = []
-                grads: List[Tensor] = []
-                momentum_buffer_list: List[Optional[Tensor]] = []
+        do_lookahead = False
+        self._la_step += 1
+        if self._la_step >= self._total_la_steps:
+            self._la_step, do_lookahead = 0, True
+        for group in optimizer.param_groups:
+            params: List[Tensor] = []
+            grads: List[Tensor] = []
+            momentum_buffer_list: List[Optional[Tensor]] = []
 
-                has_sparse_grad = optimizer._init_group(
-                    group, params, grads, momentum_buffer_list
-                )
-                if self.foreach == False:
-                    for num, param in enumerate(params):
+            has_sparse_grad = optimizer._init_group(
+                group, params, grads, momentum_buffer_list
+            )
+            if self.foreach == False:
+                for num, param in enumerate(params):
+                    if second_step:
+                        eta2_shift = eta2.add(-eta1)
                         grad, momentum_buffer = grads[num], momentum_buffer_list[num]
                         buffer_x_shift = None
                         if group["momentum"] == 0:
@@ -229,12 +267,21 @@ class NetLineStepLR:
                         else:
                             buffer_x_shift = momentum_buffer.mul(-eta2_shift)
                         param.add_(buffer_x_shift)
-                        #TODO: norm calculation drops performance, slow operation
-                        if self.do_calc_grad_norm2:
-                            grad_norm2_squared += (grad**2).sum() #.item() #Check if .item() fine for performance
-                            buffer_norm2_squared += (momentum_buffer**2).sum() #.item()
 
-                else:
+                    #TODO: norm calculation drops performance, slow operation
+                    if self.do_calc_grad_norm2:
+                        grad_norm2_squared += (grad**2).sum() #.item() #Check if .item() fine for performance
+                        buffer_norm2_squared += (momentum_buffer**2).sum() #.item()
+
+                    if do_lookahead:
+                        # Lookahead and cache the current optimizer parameters
+                        param_state = self.la_state[num]
+                        param.mul_(self.la_alpha).add_(param_state, alpha=1.0 - self.la_alpha)
+                        param_state.copy_(param)
+
+            else:
+                if second_step:
+                    eta2_shift = eta2.add(-eta1)
                     buffers_x_shift = None
                     if group["momentum"] == 0:
                         buffers_x_shift = torch._foreach_mul(grads, -eta2_shift)
@@ -244,13 +291,20 @@ class NetLineStepLR:
                     #    torch._foreach_add_(params, momentum_buffer_list, alpha=-eta2_shift)
                     torch._foreach_add_(params, buffers_x_shift)
 
-                    #TODO: norm calculation drops performance, slow operation
-                    if self.do_calc_grad_norm2:
-                        for grad_ in torch._foreach_pow(grads, 2.0):
-                            grad_norm2_squared += grad_.sum() #.item()
-                        for momentum_ in torch._foreach_pow(momentum_buffer_list, 2.0):
-                            buffer_norm2_squared += momentum_.sum() #.item()
+                #TODO: norm calculation drops performance, slow operation
+                if self.do_calc_grad_norm2:
+                    for grad_ in torch._foreach_pow(grads, 2.0):
+                        grad_norm2_squared += grad_.sum() #.item()
+                    for momentum_ in torch._foreach_pow(momentum_buffer_list, 2.0):
+                        buffer_norm2_squared += momentum_.sum() #.item()
+
+                if do_lookahead:
+                    torch._foreach_mul_(params, self.la_alpha)
+                    torch._foreach_add_(params, self.la_state, alpha=1.0 - self.la_alpha)
+                    #for num, param in enumerate(params):
+                    #    self.la_state[num].copy_(param.data)
+                    torch._foreach_copy_(self.la_state, params)
 
         logging.info("####Snl: step finish, returning step_result")
         return StepResult( eta2, eta2_pre, norm_pq, norm_qq1, cos_phi, self.alpha_epoch*alpha_momentum*alpha_drift,\
-                            grad_norm2_squared, buffer_norm2_squared, regression_beta, alpha_drift, self._qmax)
+                            grad_norm2_squared, buffer_norm2_squared, regression_beta, alpha_drift)
