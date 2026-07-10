@@ -188,8 +188,10 @@ class NetLineStepLR:
         logging.info("##Snl: Step start calculating logits and qq0")
         net.zero_grad()
         logitsG = snl_forward(net, images, self.dropout_mode) ## new gradient with dropout is generated here (1*)
+        with torch.no_grad():
+            logits0 = (logitsG if self.dropout_mode == False else snl_forward(net, images, False))
         logging.info("##Snl: calculating criterion")
-        
+
         if self.loss_kappas:
             loss, kappas = self.loss_fn_kappas.forward(logitsG, labels)
         else:
@@ -198,7 +200,6 @@ class NetLineStepLR:
         loss.backward()
         optimizer.step()
         with torch.no_grad():
-            logits0 = (logitsG if self.dropout_mode == False else snl_forward(net, images, False))
             return self.internal_step(labels, images, logits0, kappas, do_second_step)
 
     def internal_step(self, labels, images, logits0, kappas, do_second_step = True):
@@ -252,9 +253,11 @@ class NetLineStepLR:
         grad_norm2_squared, buffer_norm2_squared = 0.0, 0.0
 
         do_lookahead = False
-        self._la_step += 1
-        if self._la_step >= self._total_la_steps:
-            self._la_step, do_lookahead = 0, True
+        if self.la_alpha < 1.0:
+            self._la_step += 1
+            if self._la_step >= self._total_la_steps:
+                self._la_step, do_lookahead = 0, True
+
         for group in optimizer.param_groups:
             params: List[Tensor] = []
             grads: List[Tensor] = []

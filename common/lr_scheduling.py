@@ -12,6 +12,16 @@ def cosine_annealing2_lr(eta0, eta1, epoch_cos_start, epoch_cos_finish, epoch_cu
         return eta1
     return eta1 + 0.5*(eta0-eta1)*(1+math.cos((epoch_curr-epoch_cos_start)*math.pi/(epoch_cos_finish-epoch_cos_start)))
 
+def cosine_range_annealing2_lr(eta0, eta1, epoch_cos_start, epoch_cos_finish, radian_start, radian_end, epoch_curr):
+    if epoch_curr < epoch_cos_start:
+        return eta0
+    if epoch_cos_finish <= epoch_curr:
+        return eta1
+    
+    radian_value = radian_start + (epoch_curr-epoch_cos_start)*(radian_end - radian_start)/(epoch_cos_finish-epoch_cos_start)
+    cos_scale = 1/(math.cos(radian_start) - math.cos(radian_end))
+    return eta1 + cos_scale*(eta0-eta1)*(math.cos(radian_value)-math.cos(radian_end))
+
 def line_annealing2_lr(eta0, eta1, epoch_line_start, epoch_line_finish, epoch_curr):
     if epoch_curr < epoch_line_start:
         return eta0
@@ -116,6 +126,7 @@ def line_cosine_annealing4_lr(eta0, eta1, eta2, eta3, epoch_cos_pre, epoch_cos_s
         return eta1 + (eta2-eta1)*((epoch_curr-epoch_cos_start)/(epoch_cos_middle-epoch_cos_start))
     return eta3 + 0.5*(eta2-eta3)*(1+math.cos((epoch_curr-epoch_cos_middle)*math.pi/(epoch_cos_finish-epoch_cos_middle)))
 
+'''
 def line_annealing4_lr(eta0, eta1, eta2, eta3, epoch_cos_pre, epoch_cos_start, epoch_cos_middle, epoch_cos_finish, epoch_curr):
     if epoch_curr < epoch_cos_pre:
         return eta0
@@ -126,6 +137,7 @@ def line_annealing4_lr(eta0, eta1, eta2, eta3, epoch_cos_pre, epoch_cos_start, e
     if epoch_cos_start <= epoch_curr and epoch_curr < epoch_cos_middle:
         return eta1 + (eta2-eta1)*((epoch_curr-epoch_cos_start)/(epoch_cos_middle-epoch_cos_start))
     return eta2 + (eta3-eta2)*((epoch_curr-epoch_cos_middle)/(epoch_cos_finish-epoch_cos_middle))
+'''
 
 def cosine_annealing6_lr(eta0, eta1, eta2_1, eta2_2, eta2_3, eta3, epoch_cos_pre, epoch_cos_start\
                          , epoch_cos_middle1, epoch_cos_middle2, epoch_cos_middle3, epoch_cos_finish, epoch_curr):
