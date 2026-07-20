@@ -73,11 +73,13 @@ class NetLineStepLR:
         self.la_backup: List[Tensor] = []
 
         self.alpha_nomomentum = 0.75
+        self.alpha_nomomentum_max = self._one
         self.alpha_nomomentum_queue_size = 100
         self._alpha_nomomentum_queue_pos = 0
         self._alpha_nomomentum_queue_pos_cyclic = False
 
         self._flag_check_no_backstep = False
+        self._flag_sgd_patched_for_secondstep = False
 
     def init_params(self):
         momentum = self.optimizer.param_groups[0]['momentum']
@@ -200,7 +202,7 @@ class NetLineStepLR:
         eta2_momentum = ((1.0 - self.y_part)*eta2_raw + self.y_part * eta2_raw_y)*self.alpha_momentum
         if (is_sample_step):
             eta2 = eta2_pre = optimizer.param_groups[0]['lr']
-            self.alpha_nomomentum = self.calc_alpha_nomomentum_averaging(eta2_pre/eta2_momentum)
+            self.alpha_nomomentum = torch.minimum(self.calc_alpha_nomomentum_averaging(eta2_pre/eta2_momentum), self.alpha_nomomentum_max)
         else:
             eta2_pre = eta2_momentum*self.alpha_nomomentum
             eta2 = self.calc_eta_averaging(eta2_pre)
@@ -215,55 +217,80 @@ class NetLineStepLR:
             if self._la_step >= self._total_la_steps:
                 self._la_step, do_lookahead = 0, True
 
-        for group in optimizer.param_groups:
-            params: List[Tensor] = []
-            grads: List[Tensor] = []
-            momentum_buffer_list: List[Optional[Tensor]] = []
+        if self._flag_sgd_patched_for_secondstep == False:
+            for group in optimizer.param_groups:
+                params: List[Tensor] = []
+                grads: List[Tensor] = []
+                momentum_buffer_list: List[Optional[Tensor]] = []
 
-            has_sparse_grad = optimizer._init_group(
-                group, params, grads, momentum_buffer_list
-            )
-            if self.foreach == False:
-                for num, param in enumerate(params):
-                    grad, momentum_buffer = grads[num], momentum_buffer_list[num]
+                has_sparse_grad = optimizer._init_group(
+                    group, params, grads, momentum_buffer_list
+                )
+                if self.foreach == False:
+                    for num, param in enumerate(params):
+                        grad, momentum_buffer = grads[num], momentum_buffer_list[num]
 
+                        if not is_sample_step:
+                            if (not self._flag_check_no_backstep or eta2 > self._zero):
+                                eta2_shift = eta2.add(-eta1)
+                                buffer_x_shift = None
+                                if group["momentum"] == 0:
+                                    buffer_x_shift = grad.mul(-eta2_shift)
+                                else:
+                                    buffer_x_shift = momentum_buffer.mul(-eta2_shift)
+                                param.add_(buffer_x_shift)
+
+                        if do_lookahead:
+                            # Lookahead and cache the current optimizer parameters
+                            param_state = self.la_state[num]
+                            if self.la_alpha != 1.0:
+                                param.mul_(self.la_alpha).add_(param_state, alpha=1.0 - self.la_alpha)
+                            param_state.copy_(param)
+
+                else:
                     if not is_sample_step:
                         if (not self._flag_check_no_backstep or eta2 > self._zero):
                             eta2_shift = eta2.add(-eta1)
-                            buffer_x_shift = None
+                            buffers_x_shift = None
                             if group["momentum"] == 0:
-                                buffer_x_shift = grad.mul(-eta2_shift)
+                                buffers_x_shift = torch._foreach_mul(grads, -eta2_shift)
+                            #    torch._foreach_add_(params, grads, alpha=-eta2_shift)
                             else:
-                                buffer_x_shift = momentum_buffer.mul(-eta2_shift)
-                            param.add_(buffer_x_shift)
+                                buffers_x_shift = torch._foreach_mul(momentum_buffer_list, -eta2_shift)
+                            #    torch._foreach_add_(params, momentum_buffer_list, alpha=-eta2_shift)
+                            torch._foreach_add_(params, buffers_x_shift)
 
                     if do_lookahead:
+                        if self.la_alpha != 1.0:
+                            torch._foreach_mul_(params, self.la_alpha)
+                            torch._foreach_add_(params, self.la_state, alpha=1.0 - self.la_alpha)
+                        #for num, param in enumerate(params):
+                        #    self.la_state[num].copy_(param.data)
+                        torch._foreach_copy_(self.la_state, params)
+
+        else:
+            if not is_sample_step:
+                pg = optimizer.param_groups[0]
+                if (pg['nesterov'] == True):
+                    raise ValueError("Nesterov momentum expected to be off")
+                if (not self._flag_check_no_backstep or eta2 > self._zero):
+                    eta2_shift = eta2.add(-eta1)
+                #opt_sgd_lookahead = optim.SGD(net_lookahead.parameters(), 0.02, momentum=0.9, weight_decay=5e-3)
+                state_lr, state_weight_decay, state_momentum, state_dampening = \
+                    pg["lr"], pg["weight_decay"], pg["momentum"], pg["dampening"]
+                pg["lr"], pg["weight_decay"], pg["momentum"], pg["dampening"] = eta2_shift, .0, 1.0, 1.0
+                optimizer.step()
+                pg["lr"], pg["weight_decay"], pg["momentum"], pg["dampening"] = \
+                    state_lr, state_weight_decay, state_momentum, state_dampening
+
+            if do_lookahead:
+                for group in optimizer.param_groups:
+                    for num, param in enumerate(group['params']):
                         # Lookahead and cache the current optimizer parameters
                         param_state = self.la_state[num]
                         if self.la_alpha != 1.0:
                             param.mul_(self.la_alpha).add_(param_state, alpha=1.0 - self.la_alpha)
                         param_state.copy_(param)
-
-            else:
-                if not is_sample_step:
-                    if (not self._flag_check_no_backstep or eta2 > self._zero):
-                        eta2_shift = eta2.add(-eta1)
-                        buffers_x_shift = None
-                        if group["momentum"] == 0:
-                            buffers_x_shift = torch._foreach_mul(grads, -eta2_shift)
-                        #    torch._foreach_add_(params, grads, alpha=-eta2_shift)
-                        else:
-                            buffers_x_shift = torch._foreach_mul(momentum_buffer_list, -eta2_shift)
-                        #    torch._foreach_add_(params, momentum_buffer_list, alpha=-eta2_shift)
-                        torch._foreach_add_(params, buffers_x_shift)
-
-                if do_lookahead:
-                    if self.la_alpha != 1.0:
-                        torch._foreach_mul_(params, self.la_alpha)
-                        torch._foreach_add_(params, self.la_state, alpha=1.0 - self.la_alpha)
-                    #for num, param in enumerate(params):
-                    #    self.la_state[num].copy_(param.data)
-                    torch._foreach_copy_(self.la_state, params)
 
         logging.info("####Snl: step finish, returning step_result")
         return StepResult( eta2, eta2_pre, norm_pq, norm_qq1, cos_phi, self.alpha_nomomentum*self.alpha_momentum, self.alpha_nomomentum, qq0)
