@@ -60,6 +60,7 @@ class NetLineStepLR:
         self.do_shorten_lr_for_momentum = False #If momentum > 0, shorten lr by theoretical ratio |g|/|v|
         self.alpha_momentum = 1.0
 
+        self.ignore_eta_averaging = False
         self.lr_averaging_check_up = 1.0
         self.lr_averaging_check_down = 1.0
         self.lr_averaging_queue_size = 100
@@ -125,7 +126,7 @@ class NetLineStepLR:
             self._lr_averaging_queue_pos_cyclic = True
             self._lr_averaging_queue_pos = 0
 
-        if (self.lr_averaging_check_up >= 1.0 and self.lr_averaging_check_down >= 1.0):
+        if ((self.lr_averaging_check_up >= 1.0 and self.lr_averaging_check_down >= 1.0) or self.ignore_eta_averaging):
             return eta
 
         if not self._lr_averaging_queue_pos_cyclic:
@@ -191,9 +192,11 @@ class NetLineStepLR:
         delta_pq, delta_qq1 = pp-qq0, qq1-qq0
 
         logging.info("##Snl: calculating eta_preactivation")
-        dz = (logits1-logits0)/eta1
-        qqq = qq0[:,:,None]*(self._eye[None,:,:]-qq0[:,None,:])
-        eta2_raw_y = torch.squeeze(torch.sum(delta_pq*dz)/torch.sum(dz[:,:,None]*qqq*dz[:,None,:]))
+        eta2_raw_y = 0.0
+        if (self.y_part > 0.0):
+            dz = (logits1-logits0)/eta1
+            qqq = qq0[:,:,None]*(self._eye[None,:,:]-qq0[:,None,:])
+            eta2_raw_y = torch.squeeze(torch.sum(delta_pq*dz)/torch.sum(dz[:,:,None]*qqq*dz[:,None,:]))
 
         logging.info("##Snl: calculating eta_analytic_n2")
         norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro')
