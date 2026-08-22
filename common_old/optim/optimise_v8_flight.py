@@ -3,6 +3,7 @@ from torch import nn
 from torch.linalg import norm
 import torch.nn.functional as F
 
+import math
 import logging
 
 def labels_to_softhot(true_labels, meta):
@@ -10,56 +11,76 @@ def labels_to_softhot(true_labels, meta):
         return F.one_hot(true_labels, meta.output_dim).to(meta.device)
 
 class ParameterProcessor:
-    def __init__(self, device):
-        self.theta_current = {}
+    def __init__(self, device, foreach=False):
+        #self.theta_current = {}
         self.delta_current = {}
         self.grad_current = {}
         self.device = device
+        self.foreach = foreach
 
     def is_delta_empty(self):
         return len(self.delta_current) <= 0
     
-    def is_theta_empty(self):
-        return len(self.theta_current) <= 0
+    #def is_theta_empty(self):
+    #    return len(self.theta_current) <= 0
 
-    def save_theta(self, model):
-        with torch.no_grad():
-            for name, param in model.named_parameters():
-                self.theta_current[name] = param.detach().clone()
+    #def save_theta(self, model):
+    #    with torch.no_grad():
+    #        for name, param in model.named_parameters():
+    #            self.theta_current[name] = param.detach().clone()
 
     #TODO: slow procedure
     #theta_current must be saved at the current iteration's beginning, delta must be accumulated from previous iterations
-    def set_theta(self, model, momentum, eta, is_second_step, eta_scale = 1.0):
-        eta_w = eta * eta_scale
+    def set_theta(self, model, eta):
         with torch.no_grad():
+            params, deltas = list(), list()
             for name, param in model.named_parameters():
                 delta = self.delta_current.get(name, None)
-                theta_base = self.theta_current[name]
-                if eta_scale > 0.0:
-                    if is_second_step:
-                        #delta is of this step already
-                        self.theta_current[name] = theta_base - eta_w * delta
-                        param.data.copy_(self.theta_current[name])
-                    else:
-                        #delta is of prev step yet
-                        grad = self.grad_current.get(name)
-                        delta_no_decay = grad if delta is None or momentum <= 0.0 else momentum*delta + grad
-                        param.data.copy_(theta_base - eta_w * delta_no_decay)
+                #theta_base = self.theta_current[name]
+                if self.foreach == False:
+                    param.data.add_(delta, alpha=-eta)
                 else:
-                    raise ValueError("eta_scale must be in interval(0., 1.). momentum={}, eta={}, eta_scale={}"\
-                                     .format(momentum, eta, eta_scale))
+                    params.append(param.data)
+                    deltas.append(delta)
+
+            if self.foreach == True:
+                if isinstance(eta, torch.Tensor) and torch._utils.is_compiling():
+                    deltas_x_lr = torch._foreach_mul(deltas, -eta)
+                    torch._foreach_add_(params, deltas_x_lr)
+                else:
+                    torch._foreach_add_(params, deltas, alpha=-eta)
 
     #theta_current must be saved at the current iteration's beginning
-    def save_delta_current(self, momentum, weight_decay = 0.0, calc_norm2_squared=False):
+    def save_delta_current(self, model, momentum, weight_decay = 0.0, calc_norm2_squared=False):
         with torch.no_grad():
             norm2_squared = torch.tensor(0.0).to(self.device)
-            for name, grad in self.grad_current.items():
+            params, deltas, grads = list(), list(), list()
+            ignore_foreach = False
+            for name, param in model.named_parameters():
                 delta = self.delta_current.get(name, None)
-                theta_base = self.theta_current[name]
+                grad = self.grad_current.get(name, None)
+                if grad is None:
+                    raise ValueError("No grad for param {}".format(name))
                 if delta is None or momentum <= 0.0:
-                    self.delta_current[name] = grad + weight_decay*theta_base
+                    ignore_foreach = True
+                    self.delta_current[name] = grad + weight_decay*param
                 else:
-                    self.delta_current[name] = momentum*delta + grad + weight_decay*theta_base
+                    if self.foreach == False:
+                        delta.mul_(momentum).add_(grad, alpha=1).add_(param, alpha=weight_decay)
+                    else:
+                        params.append(param.data)
+                        deltas.append(delta)
+                        grads.append(grad)
+
+                if self.foreach == True and ignore_foreach == False:
+                    torch._foreach_mul_(deltas, momentum)
+                    torch._foreach_add_(deltas, grads, alpha=1)
+                    if weight_decay > 0:
+                        torch._foreach_add_(deltas, params, alpha=weight_decay)
+
+                #    self.delta_current[name] = grad + weight_decay*theta_base
+                #else:
+                #    self.delta_current[name] = momentum*delta + grad + weight_decay*theta_base
 
                 if calc_norm2_squared:
                     norm2_squared += ((self.delta_current[name])**2).sum() #Check if .item() fine for performance
@@ -72,7 +93,7 @@ class ParameterProcessor:
         for name, param in model.named_parameters():
             param_buffer[name] = param
         logging.info("##Autograd start")
-        df = torch.autograd.grad(loss, param_buffer.values())#, retain_graph=True, create_graph=True, allow_unused=True)
+        df = torch.autograd.grad(loss, param_buffer.values(), create_graph=False, retain_graph=False)
         logging.info("##Autograd finish")
         with torch.no_grad():
             norm2_squared = torch.tensor(0.0).to(self.device)
@@ -86,10 +107,9 @@ class ParameterProcessor:
             return norm2_squared
 
 class StepResult:
-    def __init__(self, eta, ck_armiho=0.0, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, kappa_avg=1.0, kappa_min=1.0\
+    def __init__(self, eta, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, kappa_avg=1.0, kappa_min=1.0\
                  , alpha = None, grad_norm2_squared=None, accum_norm2_squared=None, cos_phi_sample=None, ratio_sample=None):
         self.eta = eta
-        self.ck_armiho = ck_armiho
         self.pq_norm = pq_norm
         self.qq_norm = qq_norm
         self.cos_phi = cos_phi
@@ -102,20 +122,19 @@ class StepResult:
         self.alpha = alpha
 
 class NetLineStepProcessorAbstract:
-    def __init__(self, net, meta, device):
+    def __init__(self, net, meta, device, foreach=False):
         self.net = net
         self.meta = meta
         self.device = device
         self.epsilon = 1e-9
-        self.paramProcessor = ParameterProcessor(device)
+        self.paramProcessor = ParameterProcessor(device, foreach)
         self.do_logging = False #Is additional params logging performed or not, the logging may affect performance
-        self.do_calc_armiho = False #Is armiho coeff calculated or not, the calculation may affect performance
         self.do_calc_grad_norm2 = False #Is norm2 squared of gradient calculated or not, the calculation may affect performance
         self.shorten_grad_accumulated = False #If momentum > 0, shorten accum grad to the length of latest one via alpha
 
         self.alpha = 0.5 #eta multiplier
         self.beta_min = torch.tensor(0.00001).to(device) #min for eta denom for the eta-calculation stability
-        self.kappa_step_pp = 0.0125 #kappa step per trainpoint
+        self.kappa_step_pp = 0.0 #kappa step per trainpoint
         self.eta1 = 0.00001 #1st step eta-size
         self.tensor_zero = torch.tensor(0.0).to(device)
 
@@ -159,8 +178,8 @@ class NetLineStepProcessorAbstract:
             return net.forward(images)
 
 class NetLineStepProcessor(NetLineStepProcessorAbstract):
-    def __init__(self, net, meta, device):
-        super().__init__(net, meta, device)
+    def __init__(self, net, meta, device, foreach=False):
+        super().__init__(net, meta, device, foreach)
         #self.internal_criterion = nn.CrossEntropyLoss(reduction='none')
 
     def calc_criterion(self, logits, labels, pp):
@@ -176,9 +195,6 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
 
             return torch.mean(kappa*F.cross_entropy(logits, labels, reduction='none')), kappa_avg, kappa_min
 
-    """
-    step_params:
-    """
     def step(self, labels, images, momentum = 0.0, weight_decay = 0.0):
 
         net = self.net
@@ -188,8 +204,8 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
         logging.info("##Tmp: Calculating labels_to_softhot")
         pp = labels_to_softhot(labels, meta)
         logging.info("##Saving theta")
-        if self.paramProcessor.is_theta_empty():
-            self.paramProcessor.save_theta(net)
+        #if self.paramProcessor.is_theta_empty():
+        #    self.paramProcessor.save_theta(net)
 
         logging.info("##Calculating params-delta")
         net.zero_grad()
@@ -199,20 +215,22 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
         logging.info("##Criterion calculated")
         norm2_squared_latest = self.paramProcessor.calc_autograd(net, loss, self.do_calc_grad_norm2)
         logging.info("##Autograd calculated")
+        norm2_squared_accumulated = self.paramProcessor.save_delta_current(net, momentum, weight_decay, self.do_calc_grad_norm2)
+        logging.info("##Delta saved")
+        #torch.sqrt(norm2_squared_latest/norm2_squared_accumulated).item() \
+        alpha_shortening = math.sqrt(1-momentum**2) if momentum > 0.0 and self.shorten_grad_accumulated else 1.0
         with torch.no_grad():
             if self.dropout_mode:
                 logits = self.do_forward(images, False) ## all qqxx calculated with dropout off
             #Eta-calculation
             qq0 = self.softmax(logits) #q(t)
+            #Sample 
             logging.info("##Tmp: Before loss initial")
-            self.paramProcessor.set_theta(net, momentum, self.eta1, is_second_step=False, eta_scale = 1.0) #small step
+            #eta_curr = self.eta1 #small step-size
+            self.paramProcessor.set_theta(net, self.eta1) #small step
+            #logits1 = self.do_forward(images, False)
             qq1 = self.softmax(self.do_forward(images, False))
             delta_pq, delta_qq1 = pp-qq0, qq1-qq0
-
-            #delta is recalc after small step
-            norm2_squared_accumulated = self.paramProcessor.save_delta_current(momentum, weight_decay, self.do_calc_grad_norm2)
-            alpha_shortening = torch.sqrt(norm2_squared_latest/norm2_squared_accumulated).item() \
-                if momentum > 0.0 and self.shorten_grad_accumulated else 1.0
 
             logging.info("##Tmp: Before eta_analytic_n2")
             norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro')
@@ -221,21 +239,10 @@ class NetLineStepProcessor(NetLineStepProcessorAbstract):
             if self.do_logging:
                 logging.info("##alpha={}, alpha_shortening={}, eta2={}".format(self.alpha, alpha_shortening, eta2))
             logging.info("##Tmp: After eta_analytic_n2")
-            ck1_armiho = None
-            if self.do_calc_armiho:
-                loss_initial = self.crossentropy_avg(pp, qq0)
-                loss_next = self.crossentropy_avg(pp, qq1)
-                diff_initial = -(torch.sum((pp/qq0)*(delta_qq1)))/pp.shape[0]
-                ck1_armiho = (loss_next - loss_initial)/(diff_initial+self.epsilon)
-                if self.do_logging:
-                    diff_next = -(torch.sum((pp/qq1)*(delta_qq1)))/pp.shape[0]
-                    eta_ratio = eta2/(self.eta1 + self.epsilon)
-                    logging.info("##--==On step 1: eta_curr={}, eta_next={}, ratio={}, loss_initial={}, loss_next={}, diff_initial={}, diff_next={}, ck1_armiho={} ==--"\
-                                .format(self.eta1, eta2, eta_ratio, loss_initial, loss_next, diff_initial, diff_next, ck1_armiho))
-            eta_curr = eta2
-            self.paramProcessor.set_theta(net, momentum, eta_curr, is_second_step=True, eta_scale = 1.0) #1st step
-            logging.info("##Tmp:1st step finish")
+            self.paramProcessor.set_theta(net, eta2 - self.eta1) #regular step
+            logging.info("##Tmp:regular step finish")
 
             logging.info("##Tmp:finish")
-            return StepResult( eta_curr, ck1_armiho, norm_pq, norm_qq1, cos_phi, kappa_avg, kappa_min, self.alpha*alpha_shortening\
+            return StepResult( eta2, norm_pq, norm_qq1, cos_phi, kappa_avg, kappa_min, self.alpha*alpha_shortening\
                               , norm2_squared_latest, norm2_squared_accumulated)
+

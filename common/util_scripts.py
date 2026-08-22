@@ -1,6 +1,11 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
+import torch
+import torch.nn.functional as F
+
+from common.optim.util import get_meters
+
 #UTILS
 def experiment_comparison(experimental_results, experiment_num, epoch_num, title="Comparison", file_name_prefix=''):
     data = experimental_results[experiment_num, 0:epoch_num + 1]
@@ -147,3 +152,27 @@ def accuracy_comparison(exp_results, epochs_per_experiment, title="Validation ac
     #fig.tight_layout()
     ax.set_title(title)
     plt.savefig(f'run_pic/{file_name_prefix}accuracy.png', bbox_inches='tight')
+
+def calculate_accuracy(prediction, target):
+    # Note that prediction.shape == target.shape == [B, ]
+    matching = (prediction == target).float()
+    return matching.sum().item(), len(target)
+
+def test_loop(net, dataloader, device):
+    accuracy_meter, loss_meter = get_meters(2)
+    net.train(False)
+    with torch.no_grad():
+        for test_batch in dataloader:
+            images, labels = test_batch
+            images = images.to(device)
+            labels = labels.to(device)
+            logits = net.forward(images)
+
+            prediction = logits.argmax(dim=-1)
+            matches, cnt = calculate_accuracy(prediction, labels)
+            accuracy_meter.update_sum(sum_delta=matches, n=cnt)
+
+            loss = F.cross_entropy(logits, labels)
+            loss_meter.update_values(val=loss, n=cnt)
+
+    return accuracy_meter.avg(), loss_meter.avg()

@@ -28,7 +28,7 @@ def eta(eta_test, delta_pq, delta_qq, norm_pq, norm_qq, epsilon, beta_min, do_lo
     return eta_next, cos_phi
 
 class StepResult:
-    def __init__(self, eta, eta2_pre=0.0, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, alpha = None, alpha_nomomentum = None, qq0 = None):
+    def __init__(self, eta, eta2_pre=0.0, pq_norm=0.0, qq_norm=0.0, cos_phi=0.0, alpha = None, alpha_nomomentum = None, qq0 = None, qq1 = None, pow = 0):
         self.eta = eta
         self.eta2_pre = eta2_pre
         self.pq_norm = pq_norm
@@ -37,6 +37,8 @@ class StepResult:
         self.alpha = alpha
         self.alpha_nomomentum = alpha_nomomentum
         self.qq0 = qq0
+        self.qq1 = qq1
+        self.pow = pow
 
 class NetLineStepLR:
 
@@ -58,6 +60,7 @@ class NetLineStepLR:
         self.dropout_mode = False #Set true if the net uses dropout layers
         self.do_logging = False #Is additional params logging performed or not, the logging may affect performance
         self.do_shorten_lr_for_momentum = False #If momentum > 0, shorten lr by theoretical ratio |g|/|v|
+        self.backtrace_pow = 0
         self.alpha_momentum = 1.0
 
         self.ignore_eta_averaging = False
@@ -75,12 +78,10 @@ class NetLineStepLR:
 
         self.alpha_nomomentum = 0.75
         self.alpha_nomomentum_max = self._one
-        self.alpha_nomomentum_queue_size = 100
-        self._alpha_nomomentum_queue_pos = 0
-        self._alpha_nomomentum_queue_pos_cyclic = False
 
         self._flag_check_no_backstep = False
         self._flag_sgd_patched_for_secondstep = False
+        self._arctan_coeff = 4.0
 
     def init_params(self):
         momentum = self.optimizer.param_groups[0]['momentum']
@@ -126,8 +127,8 @@ class NetLineStepLR:
             self._lr_averaging_queue_pos_cyclic = True
             self._lr_averaging_queue_pos = 0
 
-        if ((self.lr_averaging_check_up >= 1.0 and self.lr_averaging_check_down >= 1.0) or self.ignore_eta_averaging):
-            return eta
+        #if ((self.lr_averaging_check_up >= 1.0 and self.lr_averaging_check_down >= 1.0) or self.ignore_eta_averaging):
+        #    return eta
 
         if not self._lr_averaging_queue_pos_cyclic:
             return eta
@@ -136,29 +137,15 @@ class NetLineStepLR:
             if (self.lr_averaging_check_up <= 0.0 and self.lr_averaging_check_down <= 0.0):
                 return eta_avg
             else:
-                eta_delta = eta - eta_avg
-                return eta_avg + eta_delta*torch.where(torch.sign(eta_delta) == self._one, self.lr_averaging_check_up, self.lr_averaging_check_down)
+                eta_delta0 = eta - eta_avg
+                eta_delta1 = eta_delta0
+                if (self.lr_averaging_check_up != 1.0 or self.lr_averaging_check_down != 1.0):
+                    eta_delta1 = eta_delta0*torch.where(torch.sign(eta_delta0) == self._one,\
+                                                        self.lr_averaging_check_up, self.lr_averaging_check_down)
+                eta_delta = torch.arctan(eta_delta1*self._arctan_coeff/eta_avg)*eta_avg/self._arctan_coeff
+                return eta_avg + eta_delta
 
-    def init_alpha_nomomentum_averaging(self):
-        self._alpha_nomomentum_queue_pos = 0
-        self._alpha_nomomentum_queue_pos_cyclic = False
-        self._alpha_nomomentum_queue = \
-            torch.full((self.alpha_nomomentum_queue_size,), fill_value=0.75, dtype=torch.float).to(self.meta.device)
-
-    def calc_alpha_nomomentum_averaging(self, alpha_nomomentum):
-        self._alpha_nomomentum_queue[self._alpha_nomomentum_queue_pos] = alpha_nomomentum
-        #pos shift
-        self._alpha_nomomentum_queue_pos += 1
-        if self._alpha_nomomentum_queue_pos >= self.alpha_nomomentum_queue_size:
-            self._alpha_nomomentum_queue_pos_cyclic = True
-            self._alpha_nomomentum_queue_pos = 0
-
-        if not self._alpha_nomomentum_queue_pos_cyclic:
-            return alpha_nomomentum
-        else:
-            return torch.mean(self._alpha_nomomentum_queue)
-
-    def step(self, labels, images, is_sample_step):
+    def step(self, labels, images, eta_target, fixed_step):
         net = self.net
         optimizer = self.optimizer
 
@@ -175,9 +162,9 @@ class NetLineStepLR:
         loss.backward()
         optimizer.step()
         with torch.no_grad():
-            return self.internal_step(labels, images, logits0, is_sample_step)
+            return self.internal_step(labels, images, logits0, eta_target, fixed_step)
 
-    def internal_step(self, labels, images, logits0, is_sample_step):
+    def internal_step(self, labels, images, logits0, eta_target, fixed_step):
         net = self.net
         meta = self.meta
         optimizer = self.optimizer
@@ -189,7 +176,15 @@ class NetLineStepLR:
         logging.info("##Snl: calculating learning rate")
         logits1 = snl_forward(net, images, False)
         qq1 = F.softmax(logits1, dim=1) #0-point, 1-neuron?
-        delta_pq, delta_qq1 = pp-qq0, qq1-qq0
+        delta_pq, delta_q1q = pp-qq0, qq1-qq0
+
+        '''
+        pt_scalar = torch.sum(delta_pq*delta_q1q, dim=1)
+        pt_pq_norm = torch.sum(delta_pq*delta_pq, dim=1)**0.5
+        pt_q1q_norm = torch.sum(delta_q1q*delta_q1q, dim=1)**0.5
+        pt_cos = pt_scalar/(pt_pq_norm*pt_q1q_norm)
+        pt_proj = pt_pq_norm*pt_cos
+        '''
 
         logging.info("##Snl: calculating eta_preactivation")
         eta2_raw_y = 0.0
@@ -199,16 +194,36 @@ class NetLineStepLR:
             eta2_raw_y = torch.squeeze(torch.sum(delta_pq*dz)/torch.sum(dz[:,:,None]*qqq*dz[:,None,:]))
 
         logging.info("##Snl: calculating eta_analytic_n2")
-        norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_qq1, ord='fro')
-        eta2_raw, cos_phi = eta(eta1, delta_pq, delta_qq1, norm_pq, norm_qq1, self.epsilon, self.beta_min, self.do_logging)
+        norm_pq, norm_qq1 = norm(delta_pq, ord='fro'), norm(delta_q1q, ord='fro')
+        eta2_raw, cos_phi = eta(eta1, delta_pq, delta_q1q, norm_pq, norm_qq1, self.epsilon, self.beta_min, self.do_logging)
 
-        eta2_momentum = ((1.0 - self.y_part)*eta2_raw + self.y_part * eta2_raw_y)*self.alpha_momentum
-        if (is_sample_step):
-            eta2 = eta2_pre = optimizer.param_groups[0]['lr']
-            self.alpha_nomomentum = torch.minimum(self.calc_alpha_nomomentum_averaging(eta2_pre/eta2_momentum), self.alpha_nomomentum_max)
+        eta2_orig_pre = ((1.0 - self.y_part)*eta2_raw + self.y_part * eta2_raw_y)
+        eta2_orig = self.calc_eta_averaging(eta2_orig_pre)
+        eta2_orig_avg = torch.mean(self._lr_averaging_queue)
+        self.alpha_nomomentum = torch.minimum(eta_target/(eta2_orig_avg*self.alpha_momentum), self.alpha_nomomentum_max)
+        alpha_full = self.alpha_nomomentum*self.alpha_momentum
+        if (fixed_step):
+            eta2 = eta2_pre = self._one * eta_target
         else:
-            eta2_pre = eta2_momentum*self.alpha_nomomentum
-            eta2 = self.calc_eta_averaging(eta2_pre)
+            eta2_pre = eta2_orig_pre * alpha_full
+            eta2 = eta2_orig * alpha_full
+
+        #backtracking
+        pow = 0
+        if self.backtrace_pow > 0:
+            eta_ratio = eta2/eta1
+            prediction0 = qq0.argmax(dim=1)
+            matching0 = (prediction0 == labels).int()
+            while pow < self.backtrace_pow:
+                qqX = qq0 + (eta_ratio*2**(-pow))*delta_q1q
+                predictionX = qqX.argmax(dim=1)
+                matchingX = (predictionX == labels).int()
+                if (matchingX & matching0 == matching0).all():
+                    break
+                pow += 1
+
+            if pow > 0:
+                eta2 = eta2*2**(-pow)
 
         if self.do_logging:
             logging.info("##Snl: alpha_epoch={}, alpha_momentum={}, eta2_pre={}, eta2={}".format(self.alpha_epoch, self.alpha_momentum, eta2_pre, eta2))
@@ -233,15 +248,14 @@ class NetLineStepLR:
                     for num, param in enumerate(params):
                         grad, momentum_buffer = grads[num], momentum_buffer_list[num]
 
-                        if not is_sample_step:
-                            if (not self._flag_check_no_backstep or eta2 > self._zero):
-                                eta2_shift = eta2.add(-eta1)
-                                buffer_x_shift = None
-                                if group["momentum"] == 0:
-                                    buffer_x_shift = grad.mul(-eta2_shift)
-                                else:
-                                    buffer_x_shift = momentum_buffer.mul(-eta2_shift)
-                                param.add_(buffer_x_shift)
+                        if (not self._flag_check_no_backstep or eta2 > self._zero):
+                            eta2_shift = eta2.add(-eta1)
+                            buffer_x_shift = None
+                            if group["momentum"] == 0:
+                                buffer_x_shift = grad.mul(-eta2_shift)
+                            else:
+                                buffer_x_shift = momentum_buffer.mul(-eta2_shift)
+                            param.add_(buffer_x_shift)
 
                         if do_lookahead:
                             # Lookahead and cache the current optimizer parameters
@@ -251,17 +265,16 @@ class NetLineStepLR:
                             param_state.copy_(param)
 
                 else:
-                    if not is_sample_step:
-                        if (not self._flag_check_no_backstep or eta2 > self._zero):
-                            eta2_shift = eta2.add(-eta1)
-                            buffers_x_shift = None
-                            if group["momentum"] == 0:
-                                buffers_x_shift = torch._foreach_mul(grads, -eta2_shift)
-                            #    torch._foreach_add_(params, grads, alpha=-eta2_shift)
-                            else:
-                                buffers_x_shift = torch._foreach_mul(momentum_buffer_list, -eta2_shift)
-                            #    torch._foreach_add_(params, momentum_buffer_list, alpha=-eta2_shift)
-                            torch._foreach_add_(params, buffers_x_shift)
+                    if (not self._flag_check_no_backstep or eta2 > self._zero):
+                        eta2_shift = eta2.add(-eta1)
+                        buffers_x_shift = None
+                        if group["momentum"] == 0:
+                            buffers_x_shift = torch._foreach_mul(grads, -eta2_shift)
+                        #    torch._foreach_add_(params, grads, alpha=-eta2_shift)
+                        else:
+                            buffers_x_shift = torch._foreach_mul(momentum_buffer_list, -eta2_shift)
+                        #    torch._foreach_add_(params, momentum_buffer_list, alpha=-eta2_shift)
+                        torch._foreach_add_(params, buffers_x_shift)
 
                     if do_lookahead:
                         if self.la_alpha != 1.0:
@@ -272,19 +285,18 @@ class NetLineStepLR:
                         torch._foreach_copy_(self.la_state, params)
 
         else:
-            if not is_sample_step:
-                pg = optimizer.param_groups[0]
-                if (pg['nesterov'] == True):
-                    raise ValueError("Nesterov momentum expected to be off")
-                if (not self._flag_check_no_backstep or eta2 > self._zero):
-                    eta2_shift = eta2.add(-eta1)
-                #opt_sgd_lookahead = optim.SGD(net_lookahead.parameters(), 0.02, momentum=0.9, weight_decay=5e-3)
-                state_lr, state_weight_decay, state_momentum, state_dampening = \
-                    pg["lr"], pg["weight_decay"], pg["momentum"], pg["dampening"]
-                pg["lr"], pg["weight_decay"], pg["momentum"], pg["dampening"] = eta2_shift, .0, 1.0, 1.0
-                optimizer.step()
-                pg["lr"], pg["weight_decay"], pg["momentum"], pg["dampening"] = \
-                    state_lr, state_weight_decay, state_momentum, state_dampening
+            pg = optimizer.param_groups[0]
+            if (pg['nesterov'] == True):
+                raise ValueError("Nesterov momentum expected to be off")
+            if (not self._flag_check_no_backstep or eta2 > self._zero):
+                eta2_shift = eta2.add(-eta1)
+            #opt_sgd_lookahead = optim.SGD(net_lookahead.parameters(), 0.02, momentum=0.9, weight_decay=5e-3)
+            state_lr, state_weight_decay, state_momentum, state_dampening = \
+                pg["lr"], pg["weight_decay"], pg["momentum"], pg["dampening"]
+            pg["lr"], pg["weight_decay"], pg["momentum"], pg["dampening"] = eta2_shift, .0, 1.0, 1.0
+            optimizer.step()
+            pg["lr"], pg["weight_decay"], pg["momentum"], pg["dampening"] = \
+                state_lr, state_weight_decay, state_momentum, state_dampening
 
             if do_lookahead:
                 for group in optimizer.param_groups:
@@ -296,4 +308,5 @@ class NetLineStepLR:
                         param_state.copy_(param)
 
         logging.info("####Snl: step finish, returning step_result")
-        return StepResult( eta2, eta2_pre, norm_pq, norm_qq1, cos_phi, self.alpha_nomomentum*self.alpha_momentum, self.alpha_nomomentum, qq0)
+        return StepResult( eta2, eta2_pre, norm_pq, norm_qq1, cos_phi, alpha_full, self.alpha_nomomentum, qq0, qq1, pow) #,\
+                          # proj_min=pt_proj.min(), proj_max=pt_proj.max(), proj_avg=pt_proj.mean())
