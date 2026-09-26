@@ -1,8 +1,14 @@
 import torch
 
 import math
+import logging
 
 DATASET_PATH = "./datasets"
+
+class MetaData:
+    def __init__(self, output_dim = 10, device='cpu'):
+        self.device = device
+        self.output_dim = output_dim
 
 class AverageMeter:
     
@@ -85,3 +91,17 @@ def cosine_annealing2_lr(eta0, eta1, epoch_cos_start, epoch_cos_finish, epoch_cu
     if epoch_cos_finish <= epoch_curr:
         return eta1
     return eta1 + 0.5*(eta0-eta1)*(1+math.cos((epoch_curr-epoch_cos_start)*math.pi/(epoch_cos_finish-epoch_cos_start)))
+
+def line_annealing2_lr(eta0, eta1, epoch_line_start, epoch_line_finish, epoch_curr):
+    if epoch_curr < epoch_line_start:
+        return eta0
+    if epoch_line_finish <= epoch_curr:
+        return eta1
+    return eta0 + (eta1-eta0)*(epoch_curr-epoch_line_start)/(epoch_line_finish-epoch_line_start)
+
+def eta_calc(lr1, delta_pq, delta_qq, norm_pq, norm_qq, beta_min):
+    dot_product = torch.sum(delta_pq*delta_qq)
+    cos_phi = dot_product/(norm_pq*norm_qq)
+    lr2 = norm_pq*cos_phi*lr1/torch.maximum(norm_qq, beta_min)
+    logging.debug(f"##net-line: cos phi={cos_phi}, dot_product={dot_product}, norm_pq={norm_pq}, norm_qq={norm_qq}, lr1={lr1}, lr2_raw={lr2}")
+    return lr2, cos_phi
