@@ -1,17 +1,17 @@
 import torch
-from torch import Tensor
-from torch import nn, optim
-from torch.linalg import norm
+from torch import Tensor, nn
 import torch.nn.functional as F
 
 import math
 import logging
-from common.optim.util import AverageCyclicQueue, MetaData
+
+from common.optim.util import MetaData
+from common.optim.optimiser import NetOptimizer
 
 
 #TODO: support multi param_groups in model
 #TODO: support foreach mode
-class NetDz(optim.Optimizer):
+class NetDz(NetOptimizer):
     def __init__(
         self,
         model: nn.Module,
@@ -19,7 +19,10 @@ class NetDz(optim.Optimizer):
         lr1: float = 1e-5,
         momentum: float = 0,
         weight_decay: float = 0,
-        maximize: bool = False
+        maximize: bool = False,
+        foreach=True,
+        lookahead_steps=5,
+        lookahead_alpha=1.0
     ) -> None:
         if lr1 < 0.0:
             raise ValueError(f"Invalid learning rate: {lr1}")
@@ -27,11 +30,13 @@ class NetDz(optim.Optimizer):
             raise ValueError(f"Invalid momentum value: {momentum}")
         if weight_decay < 0.0:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if lookahead_steps < 0:
+            raise ValueError(f"Invalid lookahead_steps value: {lookahead_steps}")
+        if lookahead_alpha < 0.0 or 1.0 < lookahead_alpha:
+            raise ValueError(f"Invalid lookahead_alpha value: {lookahead_alpha}")
 
         self.model = model
         self.meta = meta
-        self.lr_averaging_queue_size = 50
-        self._lr_averaging_queue = None
 
         self.do_shorten_lr_for_momentum = True #If momentum > 0, shorten lr by theoretical ratio |g|/|v|
         self.alpha_momentum = 1.0
@@ -44,69 +49,14 @@ class NetDz(optim.Optimizer):
             "lr1": lr1,
             "momentum": momentum,
             "weight_decay": weight_decay,
-            "maximize": maximize
+            "maximize": maximize,
+            "foreach": foreach
         }
-        super().__init__(model.parameters(), defaults)
+        super().__init__(model.parameters(), defaults, lookahead_steps, lookahead_alpha)
         if len(self.param_groups) != 1:
             raise ValueError("Model must have a single param_group")
 
         self.init_vars()
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-        #for group in self.param_groups:
-        group = self.param_groups[0]
-        group.setdefault("maximize", False)
-
-    def _init_group(self, group, params, grads, momentum_buffer_list):
-        has_sparse_grad = False
-
-        for param in group["params"]:
-            params.append(param)
-            if param.grad is not None:
-                grads.append(param.grad)
-                if param.grad.is_sparse:
-                    has_sparse_grad = True
-
-            if group["momentum"] != 0:
-                state = self.state[param]
-                momentum_buffer_list.append(state.get("momentum_buffer"))
-
-        return has_sparse_grad
-
-    @torch.no_grad()
-    def batch_prestep(self):
-
-        #for group in self.param_groups:
-        group = self.param_groups[0]
-        params: list[Tensor] = []
-        grads: list[Tensor] = []
-        momentum_buffer_list: list[Tensor | None] = []
-
-        self._init_group(
-            group, params, grads, momentum_buffer_list
-        )
-
-        momentum=group["momentum"]
-        if momentum != 0:
-            for num, param in enumerate(params):
-                buf = momentum_buffer_list[num]
-                if buf is not None:
-                    buf.mul_(momentum)
-                    param.sub_(buf)
-                    stat = self.state[param]
-                    stat["momentum_buffer"] = buf
-
-    @torch.no_grad()
-    def batch_step(self, x, y, y_pred, eta_target, epoch_fixed_step = False, arctan_coeff = None, **kwargs):
-        """Method to call in every minibatch together with step call in every epoch. Loss forward-backward performed externally
-        """
-
-        images, labels, logitsG = x, y, y_pred
-
-        fixed_step = epoch_fixed_step or self._lr_averaging_queue._pos_cyclic == False
-        if arctan_coeff is not None: self._arctan_coeff = arctan_coeff
-        return self._batch_step(images, labels, logitsG, eta_target = eta_target, fixed_step = fixed_step)
 
     @torch.no_grad()
     def _batch_step(self, images, labels, logitsG, eta_target, fixed_step):
@@ -232,26 +182,3 @@ class NetDz(optim.Optimizer):
             if momentum > 0.0 and self.do_shorten_lr_for_momentum else 1.0
 
         self._init_eta_averaging()
-
-    def _init_eta_averaging(self):
-        self._lr_averaging_queue = AverageCyclicQueue(queue_size = self.lr_averaging_queue_size, fill_value = 0.02, device = self.meta.device)
-
-    def _calc_eta_averaging(self, eta):
-        self._lr_averaging_queue.put_value(eta)
-
-        if not self._lr_averaging_queue._pos_cyclic:
-            return eta, eta
-        else:
-            eta_avg = self._lr_averaging_queue.get_avg()
-            eta_delta0 = (eta - eta_avg)
-            eta_delta = torch.arctan(eta_delta0*self._arctan_coeff/eta_avg)*eta_avg/self._arctan_coeff
-            return eta_avg + eta_delta, eta_avg
-
-    def _step_results(self, eta, eta2_pre, alpha, alpha_nomomentum, qq1):
-        result = {}
-        result['eta'] = eta
-        result['eta2_pre'] = eta2_pre
-        result['alpha'] = alpha
-        result['alpha_nomomentum'] = alpha_nomomentum
-        result['qq1'] = qq1
-        return result

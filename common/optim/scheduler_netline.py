@@ -1,4 +1,4 @@
-from torch import nn, optim
+from torch import optim
 from common.optim.util import cosine_annealing2_lr, line_annealing2_lr
 
 class CosineAnnealingNetLine:
