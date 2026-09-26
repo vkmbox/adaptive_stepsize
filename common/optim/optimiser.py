@@ -3,6 +3,7 @@ from torch import Tensor, optim
 
 import abc
 from typing import Any, TypeAlias, List, Optional
+from collections import defaultdict
 from collections.abc import Iterable
 
 from common.optim.util import AverageCyclicQueue
@@ -19,8 +20,8 @@ class NetOptimizer(optim.Optimizer, metaclass=abc.ABCMeta):
 
         self.la_alpha = lookahead_alpha
         self._total_la_steps = lookahead_steps
-        self.la_state: List[Tensor] = []
-        self.la_backup: List[Tensor] = []
+        self.la_states = defaultdict(list) #: defaultdict[int, List[Tensor]] = []
+        self.la_backups = defaultdict(list) #: defaultdict[int, List[Tensor]] = []
         self._la_step = 0  # counter for inner optimizer
 
         self.lr_averaging_queue_size = 50
@@ -104,26 +105,27 @@ class NetOptimizer(optim.Optimizer, metaclass=abc.ABCMeta):
                 self._la_step, do_lookahead = 0, True
 
         if do_lookahead:
-            for group in self.param_groups:
+            for gr_num, group in enumerate(self.param_groups):
                 params: List[Tensor] = []
                 grads: List[Tensor] = []
                 momentum_buffer_list: List[Optional[Tensor]] = []
 
+                la_state = self.la_states[gr_num]
                 has_sparse_grad = self._init_group(
                     group, params, grads, momentum_buffer_list
                 )
                 if group["foreach"] == False:
                     for num, param in enumerate(params):
                         # Lookahead and cache the current optimizer parameters
-                        param_state = self.la_state[num]
+                        param_state = la_state[num]
                         if self.la_alpha != 1.0:
                             param.mul_(self.la_alpha).add_(param_state, alpha=1.0 - self.la_alpha)
                         param_state.copy_(param)
                 else:
                     if self.la_alpha != 1.0:
                         torch._foreach_mul_(params, self.la_alpha)
-                        torch._foreach_add_(params, self.la_state, alpha=1.0 - self.la_alpha)
-                    torch._foreach_copy_(self.la_state, params)
+                        torch._foreach_add_(params, la_state, alpha=1.0 - self.la_alpha)
+                    torch._foreach_copy_(la_state, params)
 
         return res
 
@@ -144,25 +146,107 @@ class NetOptimizer(optim.Optimizer, metaclass=abc.ABCMeta):
 
     def init_lookahead(self):
         # Cache the current optimizer parameters params.append(p)
-        for group in self.param_groups:
+        for gr_num, group in enumerate(self.param_groups):
+            la_state = self.la_states[gr_num]
             for param in group['params']:
                 param_state = torch.zeros_like(param)
                 param_state.copy_(param)
-                self.la_state.append(param_state)
+                la_state.append(param_state)
 
     def _backup_and_load_cache(self):
         """Useful for performing evaluation on the slow weights (which typically generalize better)
         """
-        self.la_backup.clear()
-        for group in self.param_groups:
+        self.la_backups.clear()
+        for gr_num, group in enumerate(self.param_groups):
+            la_backup = self.la_backups[gr_num]
+            la_state = self.la_states[gr_num]
             for num, param in enumerate(group['params']):
                 backup_params = torch.zeros_like(param.data)
                 backup_params.copy_(param.data)
-                self.la_backup.append(backup_params)
-                param.data.copy_(self.la_state[num])
+                la_backup.append(backup_params)
+                param.data.copy_(la_state[num])
 
     def _clear_and_load_backup(self):
-        for group in self.param_groups:
+        for gr_num, group in enumerate(self.param_groups):
+            la_backup = self.la_backups[gr_num]
             for num, param in enumerate(group['params']):
-                param.data.copy_(self.la_backup[num])
-        self.la_backup.clear()
+                param.data.copy_(la_backup[num])
+        self.la_backups.clear()
+
+    def _step1(self):
+        grads_final = defaultdict(dict)
+
+        #Small step
+        for gr_num, group in enumerate(self.param_groups):
+            params: list[Tensor] = []
+            grads: list[Tensor] = []
+            momentum_buffer_list: list[Tensor | None] = []
+
+            maximize=group["maximize"]
+            foreach=group["foreach"]
+            weight_decay=group["weight_decay"]
+            eta1=group["lr1"]
+            has_sparse_grad = self._init_group(
+                group, params, grads, momentum_buffer_list
+            )
+
+            if foreach:
+                if maximize:
+                    grads = torch._foreach_neg(grads)
+                if weight_decay != 0:
+                    grads = torch._foreach_add(grads, params, alpha=weight_decay)
+
+                #buf = []
+                #for grad in grads: buf.append(grad.detach().clone())
+                grads_final[gr_num] = grads
+                params_shift1 = torch._foreach_mul(grads_final[gr_num], eta1)
+                torch._foreach_sub_(params, params_shift1)
+
+            else:
+                grad_final = grads_final[gr_num]
+                for num, param in enumerate(params):
+                    grad = grads[num] if not maximize else -grads[num]
+
+                    if weight_decay != 0:
+                        grad = grad.add(param, alpha=weight_decay)
+
+                    grad_final[num] = grad #.detach().clone()
+                    param_shift1 = grad_final[num].mul(eta1)
+                    param.sub_(param_shift1)
+
+        return grads_final
+
+    def _step2(self, grads_final, eta1, eta2):
+        eta2_shift = eta2.add(-eta1)
+        for gr_num, group in enumerate(self.param_groups):
+            group = self.param_groups[0]
+            params: list[Tensor] = []
+            grads: list[Tensor] = []
+            momentum_buffer_list: list[Tensor | None] = []
+
+            foreach=group["foreach"]
+            momentum = group["momentum"]
+            grad_final = grads_final[gr_num]
+            has_sparse_grad = self._init_group(
+                group, params, grads, momentum_buffer_list
+            )
+
+            if foreach:
+                params_shift2 = torch._foreach_mul(grads_final[gr_num], eta2_shift)
+                torch._foreach_sub_(params, params_shift2)
+            else:
+                for num, param in enumerate(params):
+                    param_shift2 = grad_final[num].mul(eta2_shift)
+                    param.sub_(param_shift2)
+
+            if momentum != 0:
+                for num, param in enumerate(params):
+                    buf = momentum_buffer_list[num]
+                    momentum_shift = grad_final[num].mul(eta2)
+                    if buf is None:
+                        buf = momentum_shift.detach().clone()
+                    else:
+                        buf.add_(momentum_shift)
+                    # update momentum_buffers in state
+                    stat = self.state[param]
+                    stat["momentum_buffer"] = buf

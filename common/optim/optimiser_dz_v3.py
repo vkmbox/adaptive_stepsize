@@ -1,5 +1,5 @@
 import torch
-from torch import Tensor, nn
+from torch import nn
 import torch.nn.functional as F
 
 import math
@@ -53,8 +53,8 @@ class NetDz(NetOptimizer):
             "foreach": foreach
         }
         super().__init__(model.parameters(), defaults, lookahead_steps, lookahead_alpha)
-        if len(self.param_groups) != 1:
-            raise ValueError("Model must have a single param_group")
+        #if len(self.param_groups) != 1:
+        #    raise ValueError("Model must have a single param_group")
 
         self.init_vars()
 
@@ -63,82 +63,13 @@ class NetDz(NetOptimizer):
         """Perform a single optimization step.
         """
 
-        result = None
-
-        #for group in self.param_groups:
-        group = self.param_groups[0]
-        params: list[Tensor] = []
-        grads: list[Tensor] = []
-        momentum_buffer_list: list[Tensor | None] = []
-
-        has_sparse_grad = self._init_group(
-            group, params, grads, momentum_buffer_list
-        )
-
-        result = self._single_tensor_netline(
-            images=images,
-            labels=labels,
-            logits0=logitsG,
-            params=params,
-            grads=grads,
-            momentum_buffer_list=momentum_buffer_list,
-            weight_decay=group["weight_decay"],
-            momentum=group["momentum"],
-            eta1=group["lr1"],
-            maximize=group["maximize"],
-            #foreach=group["foreach"],
-            eta_target = eta_target,
-            fixed_step = fixed_step
-        )
-
-        if group["momentum"] != 0:
-            # update momentum_buffers in state
-            for param, momentum_buffer in zip(
-                params, momentum_buffer_list, strict=True
-            ):
-                stat = self.state[param]
-                stat["momentum_buffer"] = momentum_buffer
-
-        return result
-
-    def _single_tensor_netline(
-        self,
-        images: Tensor,
-        labels: Tensor,
-        logits0: Tensor,
-        params: list[Tensor],
-        grads: list[Tensor],
-        momentum_buffer_list: list[Tensor | None],
-        weight_decay: float,
-        momentum: float,
-        eta1: float,
-        maximize: bool,
-        eta_target: float,
-        fixed_step: bool
-    ) -> None:
-        meta = self.meta
-        grads_final = {}
+        logits0 = logitsG
         #Small step
-        for num, param in enumerate(params):
-            grad = grads[num] if not maximize else -grads[num]
-
-            if weight_decay != 0:
-                grad = grad.add(param, alpha=weight_decay)
-
-            grads_final[num] = grad.detach().clone()
-
-            param_shift1 = grads_final[num].mul(eta1)
-            if momentum != 0:
-                buf = momentum_buffer_list[num]
-                if buf is None:
-                    momentum_buffer_list[num] = param_shift1
-                else:
-                    buf.add_(param_shift1)
-
-            param.sub_(param_shift1)
+        grads_final = self._step1()
 
         #Large step eta calculation
-        pp = F.one_hot(labels, meta.output_dim)
+        eta1 = self.param_groups[0]["lr1"]
+        pp = F.one_hot(labels, self.meta.output_dim)
         qq0 = F.softmax(logits0, dim=1)
         logits1 = self.model.forward(images)
         qq1 = F.softmax(logits1, dim=1)
@@ -164,16 +95,11 @@ class NetDz(NetOptimizer):
             eta2_pre = eta2_orig_pre * alpha_full
             eta2 = eta2_orig * alpha_full
 
-        logging.debug(f"##net-line: alpha_nomomentum={self.alpha_nomomentum}, alpha_momentum={self.alpha_momentum}, eta1={eta1}, eta2_pre={eta2_pre}, eta2={eta2}")
+        logging.debug(f"##net-line: alpha_nomomentum={self.alpha_nomomentum}, alpha_momentum={self.alpha_momentum}, \
+                      eta1={eta1}, eta2_pre={eta2_pre}, eta2={eta2}")
 
         #Large step
-        eta2_shift = eta2.add(-eta1)
-        for num, param in enumerate(params):
-            param_shift2 = grads_final[num].mul(eta2_shift)
-            param.sub_(param_shift2)
-            if momentum != 0:
-                momentum_buffer_list[num].add_(param_shift2)
-
+        self._step2(grads_final, eta1, eta2)
         return self._step_results(eta2, eta2_pre, alpha_full, self.alpha_nomomentum, qq1)
 
     def init_vars(self):
