@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from common.optim.util import get_meters
+from common.optim.utils import get_meters
 
 #UTILS
 def experiment_comparison(experimental_results, experiment_num, epoch_num, title="Comparison", file_name_prefix=''):

@@ -6,7 +6,9 @@ from typing import Any, TypeAlias, List, Optional
 from collections import defaultdict
 from collections.abc import Iterable
 
-from common.optim.util import AverageCyclicQueue
+from torch import nn
+
+from common.optim.utils import AverageCyclicQueue
 
 ParamsT: TypeAlias = (
     Iterable[torch.Tensor]
@@ -15,9 +17,10 @@ ParamsT: TypeAlias = (
 )
 
 class NetOptimizer(optim.Optimizer, metaclass=abc.ABCMeta):
-    def __init__(self, params: ParamsT, defaults: dict[str, Any], lookahead_steps: int, lookahead_alpha: float) -> None:
-        super().__init__(params, defaults)
+    def __init__(self, model: nn.Module, defaults: dict[str, Any], lookahead_steps: int, lookahead_alpha: float) -> None:
+        super().__init__(model.parameters(), defaults)
 
+        self.model = model
         self.la_alpha = lookahead_alpha
         self._total_la_steps = lookahead_steps
         self.la_states = defaultdict(list) #: defaultdict[int, List[Tensor]] = []
@@ -26,6 +29,7 @@ class NetOptimizer(optim.Optimizer, metaclass=abc.ABCMeta):
 
         self.lr_averaging_queue_size = 50
         self._lr_averaging_queue = None
+        self._linearity_coeff_default = 0.05
 
         self.init_lookahead()
 
@@ -60,9 +64,12 @@ class NetOptimizer(optim.Optimizer, metaclass=abc.ABCMeta):
         if not self._lr_averaging_queue._pos_cyclic:
             return eta, eta
         else:
+            linearity_coeff = self.param_groups[0]["linearity_coeff"]
+            if linearity_coeff <= 0: linearity_coeff = self._linearity_coeff_default
+
             eta_avg = self._lr_averaging_queue.get_avg()
             eta_delta0 = (eta - eta_avg)
-            eta_delta = torch.arctan(eta_delta0*self._arctan_coeff/eta_avg)*eta_avg/self._arctan_coeff
+            eta_delta = torch.arctan(eta_delta0/(eta_avg*linearity_coeff))*eta_avg*linearity_coeff
             return eta_avg + eta_delta, eta_avg
 
     @torch.no_grad()
@@ -88,15 +95,28 @@ class NetOptimizer(optim.Optimizer, metaclass=abc.ABCMeta):
                         stat["momentum_buffer"] = buf
 
     @torch.no_grad()
-    def batch_step(self, x, y, y_pred, eta_target, epoch_fixed_step = False, arctan_coeff = None, **kwargs):
+    def batch_step(self, x, y, y_pred, eta_target, epoch_fixed_step = False, **kwargs):
         """Method to call in every minibatch together with step call in every epoch. Loss forward-backward performed externally
         """
 
         images, labels, logitsG = x, y, y_pred
 
         fixed_step = epoch_fixed_step or self._lr_averaging_queue._pos_cyclic == False
-        if arctan_coeff is not None: self._arctan_coeff = arctan_coeff
-        res = self._batch_step(images, labels, logitsG, eta_target = eta_target, fixed_step = fixed_step)
+
+        batchnorms = [
+            module for module in self.model.modules()
+            if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d,
+                                   torch.nn.BatchNorm3d, torch.nn.SyncBatchNorm))
+            and module.training and module.track_running_stats
+        ]
+        res = None
+        for module in batchnorms:
+            module.track_running_stats = False
+        try:
+            res = self._batch_step(images, labels, logitsG, eta_target = eta_target, fixed_step = fixed_step)
+        finally:
+            for module in batchnorms:
+                module.track_running_stats = True
 
         do_lookahead = False
         if self.la_alpha < 1.0:

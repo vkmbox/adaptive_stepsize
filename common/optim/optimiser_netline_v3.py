@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import math
 import logging
 
-from common.optim.util import MetaData
+from common.optim.utils import MetaData
 from common.optim.optimiser import NetOptimizer
 
 
@@ -20,6 +20,7 @@ class NetLine(NetOptimizer):
         lr1: float = 1e-5,
         momentum: float = 0,
         weight_decay: float = 0,
+        linearity_coeff: float = 0.05,
         maximize: bool = False,
         foreach=True,
         lookahead_steps=5,
@@ -35,8 +36,10 @@ class NetLine(NetOptimizer):
             raise ValueError(f"Invalid lookahead_steps value: {lookahead_steps}")
         if lookahead_alpha < 0.0 or 1.0 < lookahead_alpha:
             raise ValueError(f"Invalid lookahead_alpha value: {lookahead_alpha}")
+        if linearity_coeff <= 0.0:
+            raise ValueError(f"Invalid linearity_coeff value: {linearity_coeff}")
 
-        self.model = model
+        #self.model = model
         self.meta = meta
         self.beta_min = torch.tensor(1e-20).to(meta.device)
 
@@ -52,9 +55,10 @@ class NetLine(NetOptimizer):
             "momentum": momentum,
             "weight_decay": weight_decay,
             "maximize": maximize,
-            "foreach": foreach
+            "foreach": foreach,
+            "linearity_coeff": linearity_coeff
         }
-        super().__init__(model.parameters(), defaults, lookahead_steps, lookahead_alpha)
+        super().__init__(model, defaults, lookahead_steps, lookahead_alpha)
         #if len(self.param_groups) != 1:
         #    raise ValueError("Model must have a single param_group")
 

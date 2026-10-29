@@ -1,10 +1,10 @@
-from torch import optim
-from common.optim.util import cosine_annealing2_lr, line_annealing2_lr
+from common.optim.optimiser import NetOptimizer
+from common.optim.utils import cosine_annealing2_lr, line_annealing4_lr
 
 class CosineAnnealingNetLine:
     def __init__(
         self,
-        optimizer: optim.Optimizer,
+        optimizer: NetOptimizer,
         epochs_per_experiment: int,
         epochs_warmup: int,
         epochs_shutdown: int,
@@ -37,8 +37,13 @@ class CosineAnnealingNetLine:
         self.eta_target = cosine_annealing2_lr(self.lr_max, 0.0, 0, EPOCHS_PER_EXPERIMENT, self._epoch)
 
         #self._arctan_coeff = line_annealing2_lr(4.0, 20.0, EPOCHS_PER_EXPERIMENT/3, EPOCHS_PER_EXPERIMENT*2/3, self._epoch)
-        self._arctan_coeff = line_annealing2_lr(20.0, 10.0, EPOCHS_PER_EXPERIMENT/3, EPOCHS_PER_EXPERIMENT*2/3, self._epoch)
-
+        #self._arctan_coeff = line_annealing2_lr(20.0, 10.0, EPOCHS_PER_EXPERIMENT/3, EPOCHS_PER_EXPERIMENT*2/3, self._epoch)
+        #pt0, pt1, pt2 = EPOCHS_PER_EXPERIMENT/3, EPOCHS_PER_EXPERIMENT*2/3, EPOCHS_PER_EXPERIMENT - EPOCHS_PER_EXPERIMENT/5
+        #self._arctan_coeff = 20.0 #line_annealing4_lr\
+            #(20.0, 10.0, 10.0, 5.0, min(pt0, pt1, pt2), min(pt1, pt2), max(pt1, pt2), EPOCHS_PER_EXPERIMENT, self._epoch)
+        #x 20.0, 10.0, 10.0, 50.0
+        #y 20.0, 10.0
+        #w 20.0
         self._epoch_fixed_step = self._epoch < self.epochs_warmup or self._epoch >= (self.epochs_per_experiment - self.epochs_shutdown)
 
     def batch_prestep(self):
@@ -46,4 +51,4 @@ class CosineAnnealingNetLine:
 
     def batch_step(self, x, y, y_pred, **kwargs):
         return self.optimizer.batch_step\
-            (x, y, y_pred, eta_target = self.eta_target, epoch_fixed_step = self._epoch_fixed_step, arctan_coeff = self._arctan_coeff)
+            (x, y, y_pred, eta_target = self.eta_target, epoch_fixed_step = self._epoch_fixed_step)
