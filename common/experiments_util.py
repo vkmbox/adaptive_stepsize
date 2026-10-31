@@ -1,10 +1,10 @@
 from torch import optim
 
-from optim.optimiser_netline_v3 import NetLine
-from optim.optimiser_dz_v3 import NetDz
-from optim.scheduler_netline import CosineAnnealingNetLine
-from optim.optimizer_pack1 import Lookahead, LEAP
-from experiment import ExperimentScheduler as ExperimentWithScheduler
+from common.optim.optimiser_netline_v3 import NetLine
+from common.optim.optimiser_dz_v3 import NetDz
+from common.optim.scheduler_netline import CosineAnnealingNetLine
+from common.optim.optimizer_pack1 import Lookahead, LEAP
+#from experiment import ExperimentScheduler as ExperimentWithScheduler
 
 def initialise_netline(model, meta, epochs_per_experiment, lr1, lr_max, momentum, weight_decay, linearity_coeff,\
                        la_steps = 5, la_alpha = 1.0):
@@ -53,6 +53,7 @@ def initialise_sgd(model, epochs_per_experiment, lr_max, momentum, weight_decay)
     sgd_sch = optim.lr_scheduler.CosineAnnealingLR(sgd_opt, T_max=epochs_per_experiment)
     return sgd_opt, sgd_sch
 
+'''
 def initialise_netline_experiment(model, meta, epochs_per_experiment, lr1, lr_max, momentum, weight_decay, linearity_coeff,\
                        la_steps = 5, la_alpha = 1.0):
     nl_opt, nl_sch = initialise_netline(model, meta, epochs_per_experiment, lr1, lr_max, momentum, weight_decay,\
@@ -76,3 +77,4 @@ def initialise_leap_experiment(model, epochs_per_experiment, lr_max, momentum, w
 def initialise_sgd_experiment(model, epochs_per_experiment, lr_max, momentum, weight_decay):
     sgd_opt, sgd_sch = initialise_sgd(model, epochs_per_experiment, lr_max, momentum, weight_decay)
     return ExperimentWithScheduler("sgd-cosine", model, sgd_opt, sgd_sch, do_optimiser_step=True)
+'''
