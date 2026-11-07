@@ -120,6 +120,14 @@ def make_resnet18v2(in_channels, num_classes):
     model = resnet18(num_classes=num_classes)
     return modify_torchvision_resnet(model)
 
+def _make_resnet18v2(num_classes):
+    model = resnet18(num_classes=num_classes)
+    return modify_torchvision_resnet(model)
+
 def make_resnet34v2(in_channels, num_classes):
+    model = resnet34(num_classes=num_classes)
+    return modify_torchvision_resnet(model)
+
+def _make_resnet34v2(num_classes):
     model = resnet34(num_classes=num_classes)
     return modify_torchvision_resnet(model)

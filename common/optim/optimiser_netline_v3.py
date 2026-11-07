@@ -70,6 +70,10 @@ class NetLine(NetOptimizer):
         """
 
         logits0 = logitsG
+        #uncomment to check
+        #logits0 = self.model.forward(images)
+        #assert torch.allclose(logits0, logitsG, rtol=1e-05, atol=1e-08)
+
         #Small step
         grads_final = self._step1()
 
